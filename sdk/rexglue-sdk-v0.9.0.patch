@@ -1,0 +1,3054 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 6998a45..c897883 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -86,6 +86,11 @@ class CommandProcessor {
+   virtual ~CommandProcessor();
+ 
+   uint32_t counter() const { return counter_; }
++
++  // Game-frame count, safe to read from the UI thread.
++  uint64_t guest_frame_count() const {
++    return guest_frame_count_.load(std::memory_order_relaxed);
++  }
+   void increment_counter() { counter_++; }
+ 
+   Shader* active_vertex_shader() const { return active_vertex_shader_; }
+@@ -96,6 +101,10 @@ class CommandProcessor {
+ 
+   void CallInThread(std::function<void()> fn);
+ 
++  // Rebuild backend graphics state using the current configuration.
++  // Must be called on the command processor worker thread.
++  bool ReinitializeContext();
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -270,6 +279,7 @@ class CommandProcessor {
+   std::vector<uint32_t> me_bin_;
+ 
+   uint32_t counter_ = 0;
++  std::atomic<uint64_t> guest_frame_count_{0};
+ 
+   uint32_t primary_buffer_ptr_ = 0;
+   uint32_t primary_buffer_size_ = 0;
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index d977ebe..da1a5d4 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -416,7 +416,45 @@ class D3D12CommandProcessor : public CommandProcessor {
+   bool EndGuestOcclusionQuery(uint32_t sample_count_address,
+                               xenos::xe_gpu_depth_sample_counts* sample_counts);
+   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
+-  void DisableHostOcclusionQueries();
++  void DisableHostOcclusionQueries(const char* reason = nullptr);
++  void CloseActiveOcclusionQuery();
++  bool ResolveOcclusionQueryToGuest(uint32_t host_index,
++                                    xenos::xe_gpu_depth_sample_counts* sample_counts);
++  // Guest queries that were closed early because the guest began another
++  // one before ending this one: sample-count address -> host query index,
++  // already EndQuery'd and waiting to be resolved.
++  std::unordered_map<uint32_t, uint32_t> closed_occlusion_queries_;
++  // The Xenos Z-pass counter is free-running: the guest snapshots it into a
++  // buffer, draws, snapshots again into a DIFFERENT buffer, and subtracts.
++  // So we keep a cumulative host total and hand that out on every snapshot.
++  uint64_t occlusion_running_total_ = 0;
++  // Snapshots written but not yet backed by a resolved query: the guest address
++  // the value went to, and the host query covering the interval that follows it.
++  // Both are needed so the value can be corrected in place once resolved.
++  struct PendingOcclusionSnapshot {
++    uint32_t guest_addr;
++    uint32_t host_index;
++    bool has_query;
++  };
++  std::vector<PendingOcclusionSnapshot> occlusion_pending_;
++  // Intervals closed but not yet resolved. Drained in one submission with a
++  // single GPU wait when a closing snapshot needs the total to be exact.
++  std::vector<uint32_t> occlusion_pending_slots_;
++  // Occlusion queries are resolved ONCE per frame, not once per snapshot:
++  // waiting on a fence per snapshot meant ~88 full CPU/GPU syncs per frame.
++  // Snapshots publish the previous frame's cumulative totals, so a delta is one
++  // frame old - invisible for coronas, and it removes the stall entirely.
++  std::vector<uint32_t> occlusion_frame_slots_;
++  std::vector<uint32_t> occlusion_snapshot_marks_;
++  std::vector<uint32_t> occlusion_snapshot_addrs_;
++  // Keyed by the guest's sample-count address, NOT by snapshot position: the
++  // game uses a fixed buffer per corona (0xC0 stride), so the address is stable
++  // frame to frame while the *order* and *count* of coronas tested is not.
++  // Indexing by position made a light inherit another light's delta whenever
++  // the visible set changed, which showed up as coronas popping and flickering
++  // when turning quickly.
++  uint64_t occlusion_last_published_ = 0;
++  void FlushOcclusionFrameQueries();
+   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
+   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
+                                  uint64_t samples);
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index 942450b..4f848f8 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -70,6 +70,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
+ 
+   RegisterFile* register_file() { return &register_file_; }
+   CommandProcessor* command_processor() const { return command_processor_.get(); }
++  uint64_t guest_frame_count() const override;
+ 
+   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override;
+   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
+@@ -80,6 +81,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
++  // Rebuild the graphics backend synchronously on the GPU worker thread.
++  bool ReinitializeContext() override;
++
+   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                                bool blocking) override;
+ 
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 8f34d97..b8a445d 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+@@ -37,6 +38,14 @@ class InputSystem : public system::IInputSystem {
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
+ 
++  // Runs on GetState()'s merged button bitmask, just before it's returned
++  // to the guest, letting a title conditionally strip a specific button
++  // (e.g. "confirm" while a particular menu item is highlighted) without
++  // touching guest code or globally gating all input the way
++  // SetActiveCallback does. Registering no filter preserves the merged
++  // bitmask exactly - this is a no-op for any title that doesn't call it.
++  void SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback);
++
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+@@ -46,6 +55,7 @@ class InputSystem : public system::IInputSystem {
+   rex::ui::Window* window_ = nullptr;
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
++  std::function<uint16_t(uint16_t buttons)> button_filter_callback_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index d4188df..55b06c9 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -30,6 +30,22 @@ class MnkInputDriver final : public InputDriver,
+ 
+   X_STATUS Setup() override;
+ 
++  // Direct-look support. With the mnk_direct_look cvar set, mouse motion is NOT
++  // folded into the right thumbstick; the host takes the raw deltas instead and
++  // applies them to the game's own aim angles. Stick emulation inherits the
++  // title's deadzone, acceleration curve and turn-rate cap, which is what makes
++  // mouse aiming feel wrong no matter how sensitivity is set.
++  // Returns false when no driver is active.
++  static bool ConsumeLookDelta(int32_t& dx_out, int32_t& dy_out);
++
++  // Called with the accumulated mouse delta from inside GetState - i.e. on the
++  // guest thread, once per guest input poll, which is once per game frame.
++  // Applying aim there keeps the injection in lockstep with the game's own
++  // update; doing it from the host present thread instead lets the two rates
++  // drift, so some frames get two updates and some none, which reads as jitter.
++  using LookDeltaSink = void (*)(int32_t dx, int32_t dy);
++  static void SetLookDeltaSink(LookDeltaSink sink);
++
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
+                            X_INPUT_CAPABILITIES* out_caps) override;
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
+@@ -45,6 +61,7 @@ class MnkInputDriver final : public InputDriver,
+   void OnMouseDown(rex::ui::MouseEvent& e) override;
+   void OnMouseUp(rex::ui::MouseEvent& e) override;
+   void OnMouseMove(rex::ui::MouseEvent& e) override;
++  void OnMouseWheel(rex::ui::MouseEvent& e) override;
+ 
+   // WindowListener
+   void OnClosing(rex::ui::UIEvent& e) override;
+@@ -58,18 +75,28 @@ class MnkInputDriver final : public InputDriver,
+   void UpdateMouseCapture();
+   void SetKeyState(uint16_t vk, bool down);
+   void EnqueueKeystroke(uint16_t vk_pad, bool down);
++  void EnqueueBoundPadKeystrokes(rex::ui::VirtualKey pressed, bool down);
++
++  static MnkInputDriver* active_instance_;
++  static LookDeltaSink look_delta_sink_;
+ 
+   rex::ui::Window* attached_window_ = nullptr;
+ 
+   std::mutex state_mutex_;
+   bool key_down_[256] = {};
+ 
++  // Wheel notches waiting to be reported. A wheel tick has no press/release,
++  // so it is surfaced as a single-poll virtual press of "WheelUp"/"WheelDown".
++  int32_t wheel_up_pending_ = 0;
++  int32_t wheel_down_pending_ = 0;
++
+   // Mouse delta tracking
+   int32_t mouse_dx_ = 0;
+   int32_t mouse_dy_ = 0;
+   int32_t prev_mouse_x_ = 0;
+   int32_t prev_mouse_y_ = 0;
+   bool mouse_captured_ = false;
++  bool use_relative_mouse_ = false;
+   // Cursor visibility to restore on capture release - the window owner may run
+   // an auto-hide policy that capture must not permanently override.
+   rex::ui::Window::CursorVisibility precapture_cursor_visibility_ =
+diff --git a/include/rex/kernel/xam/local_leaderboards.h b/include/rex/kernel/xam/local_leaderboards.h
+new file mode 100644
+index 0000000..87bf22e
+--- /dev/null
++++ b/include/rex/kernel/xam/local_leaderboards.h
+@@ -0,0 +1,96 @@
++/**
++ * @file        kernel/xam/local_leaderboards.h
++ * @brief       Offline Xbox LIVE leaderboards, filled from the title's own
++ *              stats writes and read back through the regular stats APIs.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace rex::kernel::xam::leaderboards {
++
++// Titles report scores with XSessionWriteStats and read leaderboards with
++// XUserCreateStatsEnumerator* / XUserReadStats. With no Xbox LIVE service
++// behind them, every stats write is kept as a local leaderboard entry (per
++// view, best first) in <user data>/leaderboards/<title id>.txt, and reads are
++// answered from that list. Columns are mapped to the written properties with
++// the title's own leaderboard definitions (the "XVC2" section of its SPA).
++
++// XUSER_DATA scalar: the type byte and the raw value (32-bit types use the
++// low half).
++struct UserData {
++  uint8_t type = 0;
++  uint64_t bits = 0;
++};
++
++// XUSER_PROPERTY, as written by XSessionWriteStats.
++struct Property {
++  uint32_t id = 0;
++  UserData value;
++};
++
++// XUSER_STATS_SPEC: a view and the column attribute ids to return.
++struct StatsSpec {
++  uint32_t view_id = 0;
++  std::vector<uint16_t> columns;
++};
++
++// XamUserCreateStatsEnumerator's enumeration types.
++enum class EnumerateBy : uint32_t { kXuid = 0, kRank = 1, kRating = 2 };
++
++// A host-side XUSER_STATS_READ_RESULTS, laid out into guest memory by Write()
++// once the destination address is known.
++class ResultSet {
++ public:
++  struct Row {
++    uint64_t xuid = 0;
++    uint32_t rank = 0;
++    int64_t rating = 0;
++    std::string gamertag;
++    std::vector<std::pair<uint16_t, UserData>> columns;
++  };
++  struct View {
++    uint32_t view_id = 0;
++    uint32_t total_rows = 0;
++    std::vector<Row> rows;
++  };
++
++  std::vector<View>& views() { return views_; }
++
++  // Bytes Write() needs.
++  uint32_t size() const;
++
++  // Writes the results to `host`, which the guest sees at `guest_address`.
++  void Write(uint8_t* host, uint32_t guest_address) const;
++
++ private:
++  std::vector<View> views_;
++};
++
++// Parses `count` guest XUSER_STATS_SPEC structures.
++std::vector<StatsSpec> ReadSpecs(const uint8_t* specs, uint32_t count);
++
++// Records one view of an XSessionWriteStats call as a leaderboard entry.
++void RecordStats(uint32_t view_id, uint64_t xuid, const std::vector<Property>& properties);
++
++// XUserCreateStatsEnumeratorBy{Xuid,Rank,Rating}.
++ResultSet QueryEnumerator(const std::vector<StatsSpec>& specs, EnumerateBy by, uint64_t pivot,
++                          uint32_t num_rows);
++
++// XUserReadStats: one row per requested player (rank 0 when unranked).
++ResultSet QueryPlayers(const std::vector<StatsSpec>& specs, const std::vector<uint64_t>& xuids);
++
++// There is no friends list offline. Enumerations a title sets up for one are
++// remembered here so XamEnumerate can report them empty rather than invalid,
++// which lets a Friends leaderboard fall through to the local player's row.
++void RegisterEmptyEnumeration(uint32_t handle);
++bool IsEmptyEnumeration(uint32_t handle);
++
++}  // namespace rex::kernel::xam::leaderboards
+diff --git a/include/rex/kernel/xam/ui_hooks.h b/include/rex/kernel/xam/ui_hooks.h
+new file mode 100644
+index 0000000..61c6c32
+--- /dev/null
++++ b/include/rex/kernel/xam/ui_hooks.h
+@@ -0,0 +1,29 @@
++/**
++ * @file        kernel/xam/ui_hooks.h
++ * @brief       Title-overridable hooks for otherwise-stubbed Xam system UI
++ *              calls.
++ *
++ * @copyright   Copyright (c) 2026, Tom Clay <tomc@tctechstuff.com>
++ *              All rights reserved.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#pragma once
++
++#include <functional>
++
++namespace rex::kernel::xam {
++
++// Some Xbox system UI entry points (achievements viewer, etc.) have no
++// equivalent on PC and are stubbed to a no-op warning by default. A title
++// app can register a callback here to run its own native UI instead (e.g. a
++// PC settings dialog) when the guest calls one of these. Registering no
++// callback preserves the original stub behavior exactly.
++//
++// Safe to call from OnPostSetup() or later, once the runtime/kernel and an
++// ImGuiDrawer are available.
++void SetShowAchievementsUICallback(std::function<void()> callback);
++
++}  // namespace rex::kernel::xam
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 2d571e3..82da90f 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -196,6 +196,13 @@ struct FPSCRRegister {
+ 
+   inline uint32_t loadFromHost() noexcept {
+     csr = getcsr();
++    // Host FP exceptions must never actually trap: this recompiler does not
++    // deliver a guest-visible FP exception interrupt, so re-assert the mask
++    // in case something else running on this thread (a driver, a codec, an
++    // SIMD builder for a saturating conversion) touched MXCSR/FPCR without
++    // preserving it.
++    Platform::InitHostExceptions(csr);
++    setcsr(csr);
+     return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
+   }
+ 
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 14dbc53..663aa31 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -210,6 +210,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   virtual void OnWindowMinimized() {}
+   virtual void OnWindowRestored() {}
+ 
++  /// Visible host window title.
++  virtual std::string GetWindowTitle() const;
++
+   /// Creates the overlay toggled by bind_achievements. Override to replace the
+   /// built-in achievement UI. Returning nullptr disables the overlay.
+   virtual std::unique_ptr<ui::ImGuiDialog> CreateAchievementsOverlay();
+@@ -249,6 +252,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   const std::filesystem::path& update_data_root() const { return update_data_root_; }
+   const std::filesystem::path& cache_root() const { return cache_root_; }
+   const std::filesystem::path& metadata_root() const { return metadata_root_; }
++  const std::filesystem::path& config_path() const { return config_path_; }
+ 
+   /// Set a callback that provides guest frame stats to the debug overlay.
+   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
+@@ -296,6 +300,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   // Built-in overlays
+   std::shared_ptr<LogCaptureSink> log_sink_;
+   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
++  std::unique_ptr<ui::FpsOverlayDialog> fps_overlay_;
+   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
+   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
+diff --git a/include/rex/system/function_dispatcher.h b/include/rex/system/function_dispatcher.h
+index 0a2a983..918a255 100644
+--- a/include/rex/system/function_dispatcher.h
++++ b/include/rex/system/function_dispatcher.h
+@@ -22,6 +22,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <rex/cvar.h>
+ #include <rex/memory.h>
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/ppc/context.h>
+@@ -29,6 +30,14 @@
+ #include <rex/system/thread_state.h>
+ #include <rex/thread/mutex.h>
+ 
++// TEMP_MENU_SCAN: when true, ResolveIndirectFunction logs every guest
++// address it resolves - lets a consumer (e.g. a game's app-side debug
++// hotkey) see every indirect (function-pointer) call target in real time,
++// which is how a menu item's "on select" handler would be invoked if it's
++// dispatched through a stored function pointer. Off by default (zero
++// overhead - a single relaxed atomic load per indirect call).
++REXCVAR_DECLARE(bool, trace_indirect_calls);
++
+ namespace rex::runtime {
+ 
+ // Forward declarations
+diff --git a/include/rex/system/gpu_plugin.h b/include/rex/system/gpu_plugin.h
+index 453c210..b910179 100644
+--- a/include/rex/system/gpu_plugin.h
++++ b/include/rex/system/gpu_plugin.h
+@@ -29,7 +29,7 @@
+ namespace rex::system {
+ 
+ // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
+-inline constexpr uint32_t kGpuPluginAbiVersion = 1;
++inline constexpr uint32_t kGpuPluginAbiVersion = 2;
+ 
+ inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
+ inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";
+diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
+index d54df86..a4a7176 100644
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -57,6 +57,10 @@ class IGraphicsSystem {
+   virtual ui::GraphicsProvider* provider() const { return nullptr; }
+   virtual ui::Presenter* presenter() const { return nullptr; }
+ 
++  // Number of guest swap/present packets processed. Backends without a
++  // guest command processor may leave the default value of zero.
++  virtual uint64_t guest_frame_count() const { return 0; }
++
+   // Guest GPU services reached from the xboxkrnl Vd* exports.
+   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
+     (void)callback;
+@@ -71,6 +75,9 @@ class IGraphicsSystem {
+     (void)block_size_log2;
+   }
+ 
++  // Rebuild backend graphics state using the current configuration.
++  // Backends that don't support this may leave the default implementation.
++  virtual bool ReinitializeContext() { return false; }
+   // Persistent shader/pipeline storage under the cache root. Default: none.
+   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                                        bool blocking) {
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec37017..a5c8bf2 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -218,7 +218,16 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  // XUSER_SIGNIN_STATE: 0 = not signed in, 1 = signed in locally, 2 = signed
++  // in to Live. Defaults to 1 (local profile, not claiming any Live
++  // connectivity) to preserve existing behavior for every title - opt a
++  // specific title into reporting 2 via set_signin_state() only if its own
++  // UI code distinguishes "signed in locally" from "signed in to Live" (as
++  // opposed to just checking the general achievements/UI hooks this SDK
++  // already handles) and would otherwise show its own native "please sign
++  // in" screen for a check this SDK has no other way to satisfy.
++  uint32_t signin_state() const { return signin_state_; }
++  void set_signin_state(uint32_t state) { signin_state_ = state; }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+@@ -229,6 +238,7 @@ class UserProfile {
+  private:
+   uint64_t xuid_;
+   std::string name_;
++  uint32_t signin_state_ = 1;
+   std::vector<std::unique_ptr<Setting>> setting_list_;
+   std::unordered_map<uint32_t, Setting*> settings_;
+   KernelState* kernel_state_ = nullptr;
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index c72b628..c18807b 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -12,6 +12,7 @@
+ #ifndef REX_UI_IMGUI_DRAWER_H_
+ #define REX_UI_IMGUI_DRAWER_H_
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -58,6 +59,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+   void Draw(UIDrawContext& ui_draw_context) override;
+ 
++  // Whether a modal popup (BeginPopupModal) was open as of the last-drawn
++  // frame. Safe to call from any thread - backed by a plain atomic rather
++  // than live ImGui state, since ImGui's context isn't thread-safe and this
++  // is read from the input system's active-callback, which guest threads
++  // can invoke concurrently with the UI thread's own Draw().
++  bool HasOpenModalPopup() const { return has_open_modal_popup_.load(std::memory_order_relaxed); }
++
+  protected:
+   void OnKeyDown(KeyEvent& e) override;
+   void OnKeyUp(KeyEvent& e) override;
+@@ -119,6 +127,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+   double frame_time_tick_frequency_;
+   uint64_t last_frame_time_ticks_;
++
++  std::atomic<bool> has_open_modal_popup_{false};
+ };
+ 
+ }  // namespace ui
+diff --git a/include/rex/ui/overlay/debug_overlay.h b/include/rex/ui/overlay/debug_overlay.h
+index e15e410..731ec7c 100644
+--- a/include/rex/ui/overlay/debug_overlay.h
++++ b/include/rex/ui/overlay/debug_overlay.h
+@@ -44,4 +44,23 @@ class DebugOverlayDialog : public ImGuiDialog {
+ #endif
+ };
+ 
++class FpsOverlayDialog : public ImGuiDialog {
++ public:
++  using FrameStatsProvider = DebugOverlayDialog::FrameStatsProvider;
++
++  explicit FpsOverlayDialog(ImGuiDrawer* imgui_drawer,
++                            FrameStatsProvider stats_provider = {});
++  ~FpsOverlayDialog();
++
++  void SetStatsProvider(FrameStatsProvider provider) {
++    stats_provider_ = std::move(provider);
++  }
++
++ protected:
++  void OnDraw(ImGuiIO& io) override;
++
++ private:
++  FrameStatsProvider stats_provider_;
++};
++
+ }  // namespace rex::ui
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..7efb4be 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <condition_variable>
+@@ -977,6 +978,10 @@ class Presenter {
+   // rather than being blank.
+   bool guest_output_active_last_refresh_ = false;
+ 
++  // Host-side presentation limiter. Guest output generation continues normally;
++  // only presentation of the newest mailbox image is rate-limited.
++  std::chrono::steady_clock::time_point present_frame_limit_last_present_time_{};
++
+   // Ordered by the Z order, and then by the time of addition.
+   // Note: All the iteration logic involving this Z ordering must be the same as
+   // in input handling (in the input listeners in the Window), but in reverse.
+diff --git a/include/rex/ui/ui_event.h b/include/rex/ui/ui_event.h
+index 99dea21..91c7e77 100644
+--- a/include/rex/ui/ui_event.h
++++ b/include/rex/ui/ui_event.h
+@@ -126,8 +126,15 @@ class MouseEvent : public UIEvent {
+   static constexpr uint32_t kScrollPerDetent = 120;
+ 
+   explicit MouseEvent(Window* target, Button button, int32_t x, int32_t y, int32_t scroll_x = 0,
+-                      int32_t scroll_y = 0)
+-      : UIEvent(target), button_(button), x_(x), y_(y), scroll_x_(scroll_x), scroll_y_(scroll_y) {}
++                      int32_t scroll_y = 0, int32_t rel_x = 0, int32_t rel_y = 0)
++      : UIEvent(target),
++        button_(button),
++        x_(x),
++        y_(y),
++        scroll_x_(scroll_x),
++        scroll_y_(scroll_y),
++        rel_x_(rel_x),
++        rel_y_(rel_y) {}
+   ~MouseEvent() override = default;
+ 
+   bool is_handled() const { return handled_; }
+@@ -138,6 +145,10 @@ class MouseEvent : public UIEvent {
+   int32_t y() const { return y_; }
+   int32_t scroll_x() const { return scroll_x_; }
+   int32_t scroll_y() const { return scroll_y_; }
++  // True relative motion as reported by the platform. Preferred over differencing
++  // absolute positions, which loses or doubles movement around a cursor warp.
++  int32_t rel_x() const { return rel_x_; }
++  int32_t rel_y() const { return rel_y_; }
+ 
+  private:
+   bool handled_ = false;
+@@ -147,6 +158,8 @@ class MouseEvent : public UIEvent {
+   int32_t scroll_x_ = 0;
+   // Positive is up (away from the user), negative is down (towards the user).
+   int32_t scroll_y_ = 0;
++  int32_t rel_x_ = 0;
++  int32_t rel_y_ = 0;
+ };
+ 
+ class TouchEvent : public UIEvent {
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index 00634da..6f60f26 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -300,6 +300,8 @@ class Window {
+   // in the implementation.
+   bool IsMouseCaptureRequested() const { return mouse_capture_request_count_ != 0; }
+   void CaptureMouse();
++  // Hides the cursor and delivers unbounded relative motion, with no warping.
++  virtual void SetRelativeMouseMode(bool enabled) { (void)enabled; }
+   void ReleaseMouse();
+ 
+   // Desired state stored by the common Window, externally modifiable, read-only
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 5d8476f..adf9724 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -33,6 +33,12 @@ class WindowSDL final : public Window {
+ 
+   void* GetNativeWindowHandle() const override;
+ 
++  // Resize the normal window immediately. SDL will report the resulting
++  // physical size through the existing resize event path, which updates the
++  // presenter surface.
++  void SetLogicalSize(uint32_t logical_width, uint32_t logical_height);
++  void SetRelativeMouseMode(bool enabled) override;
++
+   // Called by SDLWindowedAppContext on the UI thread.
+   void HandleWindowEvent(SDL_Event& event);
+   void HandleKeyEvent(SDL_Event& event);
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 60efcd3..c2f2083 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -239,6 +239,11 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
+   }
+ }
+ 
++bool CommandProcessor::ReinitializeContext() {
++  ShutdownContext();
++  return SetupContext();
++}
++
+ void CommandProcessor::ClearCaches() {}
+ 
+ void CommandProcessor::InvalidateGpuMemory() {}
+@@ -1097,6 +1102,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  guest_frame_count_.fetch_add(1, std::memory_order_relaxed);
+ 
+   ++counter_;
+   return true;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index efed1b7..4ce4b10 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -187,58 +187,97 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+   auto* sample_counts =
+       memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
+   if (!sample_counts) {
+-    DisableHostOcclusionQueries();
+     return true;
+   }
+ 
+-  auto write_fallback_result = [sample_counts, kQueryFinished]() -> bool {
+-    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+-    if (fake_sample_count < 0) {
+-      return true;
+-    }
+-    bool is_end_via_z_pass =
+-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+-    bool is_end_via_z_fail =
+-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+-    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+-    if (is_end_via_z_pass || is_end_via_z_fail) {
+-      sample_counts->ZPass_A = fake_sample_count;
+-      sample_counts->Total_A = fake_sample_count;
+-    }
+-    return true;
+-  };
++  // The guest pre-fills the block with 0xFFFFFEED to mark the CLOSING snapshot
++  // of a pair; anything else opens one.
++  const bool is_end =
++      (sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished) ||
++      (sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished);
+ 
+-  bool is_end_via_z_pass =
+-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+-  bool is_end_via_z_fail =
+-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
+-
+-  if (!is_end) {
+-    if (active_occlusion_query_.valid &&
+-        active_occlusion_query_.sample_count_address != sample_count_addr) {
+-      DisableHostOcclusionQueries();
+-      return write_fallback_result();
+-    }
+-    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
+-      return write_fallback_result();
++  // ZPD snapshots a free-running Z-pass counter and the guest subtracts pairs of
++  // them, so every interval has to be counted - dropping the ones between
++  // coronas loses samples the guest includes, and everything reads as hidden.
++  //
++  // But the values do not have to be final the instant they are written. The
++  // guest cannot use a snapshot until it has the matching one to subtract, so
++  // opening snapshots can be written provisionally and CORRECTED IN PLACE once
++  // the closing snapshot forces a resolve - their addresses are recorded here
++  // for exactly that. That turns one CPU/GPU sync per snapshot into one per
++  // pair, roughly a 5x reduction, with identical results.
++  if (active_occlusion_query_.valid && occlusion_query_heap_) {
++    uint32_t host_index = active_occlusion_query_.host_index;
++    active_occlusion_query_ = {};
++    if (BeginSubmission(true)) {
++      deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                         host_index);
++      if (!occlusion_pending_.empty()) {
++        occlusion_pending_.back().host_index = host_index;
++        occlusion_pending_.back().has_query = true;
++      }
+     }
+-    return true;
+   }
+ 
+-  if (!active_occlusion_query_.valid ||
+-      active_occlusion_query_.sample_count_address != sample_count_addr) {
+-    DisableHostOcclusionQueries();
+-    return write_fallback_result();
++  if (is_end && occlusion_query_heap_ && occlusion_query_readback_ &&
++      !occlusion_pending_.empty()) {
++    if (BeginSubmission(true)) {
++      for (const auto& p : occlusion_pending_) {
++        if (!p.has_query) continue;
++        deferred_command_list_.D3DResolveQueryData(
++            occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, p.host_index, 1,
++            occlusion_query_readback_.Get(), sizeof(uint64_t) * p.host_index);
++      }
++      if (EndSubmission(false)) {
++        uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
++        CheckSubmissionFence(query_submission);
++        if (submission_completed_ >= query_submission && occlusion_query_readback_mapping_) {
++          // Replay the interval in order, rewriting each provisional snapshot
++          // with the total that was true at the moment it was taken.
++          for (const auto& p : occlusion_pending_) {
++            auto* block =
++                memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(p.guest_addr);
++            if (block) {
++              WriteGuestOcclusionResult(block, occlusion_running_total_);
++            }
++            if (p.has_query) {
++              occlusion_running_total_ +=
++                  NormalizeOcclusionSamples(occlusion_query_readback_mapping_[p.host_index]);
++            }
++          }
++        }
++      }
++    }
++    occlusion_pending_.clear();
+   }
+ 
+-  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
+-    return write_fallback_result();
++  // Write the value for this snapshot, and remember where it went so it can be
++  // corrected when the pair closes.
++  WriteGuestOcclusionResult(sample_counts, occlusion_running_total_);
++  if (!is_end) {
++    occlusion_pending_.push_back({sample_count_addr, 0, false});
+   }
+-
++  BeginGuestOcclusionQuery(sample_count_addr);
+   return true;
+ }
+ 
++// Closes any query still open at the frame boundary so one cannot leak across
++// frames. Resolution happens per snapshot, in the handler above.
++void D3D12CommandProcessor::FlushOcclusionFrameQueries() {
++  if (active_occlusion_query_.valid && occlusion_query_heap_) {
++    uint32_t host_index = active_occlusion_query_.host_index;
++    active_occlusion_query_ = {};
++    if (BeginSubmission(true)) {
++      deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                         host_index);
++    }
++  }
++  occlusion_frame_slots_.clear();
++  occlusion_snapshot_marks_.clear();
++  occlusion_snapshot_addrs_.clear();
++  occlusion_pending_.clear();
++}
++
+ bool D3D12CommandProcessor::PushTransitionBarrier(ID3D12Resource* resource,
+                                                   D3D12_RESOURCE_STATES old_state,
+                                                   D3D12_RESOURCE_STATES new_state,
+@@ -1917,6 +1956,8 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
++  FlushOcclusionFrameQueries();
++
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -3455,8 +3496,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     assert_false(scratch_buffer_used_);
+ 
+     if (active_occlusion_query_.valid && occlusion_query_heap_) {
++      // A query cannot stay open across a submission, so close it here - but
++      // REMEMBER it. Perfect Dark's Begin and End straddle submission
++      // boundaries, so simply discarding the record meant every End arrived to
++      // find nothing outstanding and fell back to the fake "fully visible"
++      // sample count, which is what drew light glares through walls.
+       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                          active_occlusion_query_.host_index);
++      occlusion_frame_slots_.push_back(active_occlusion_query_.host_index);
+       active_occlusion_query_ = {};
+     }
+ 
+@@ -4865,6 +4912,13 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
+ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
+   active_occlusion_query_ = {};
+   occlusion_query_cursor_ = 0;
++  occlusion_running_total_ = 0;
++  occlusion_pending_.clear();
++  occlusion_frame_slots_.clear();
++  occlusion_snapshot_marks_.clear();
++  occlusion_snapshot_addrs_.clear();
++  occlusion_last_published_ = 0;
++  closed_occlusion_queries_.clear();
+   occlusion_query_resources_available_ = false;
+   occlusion_query_heap_.Reset();
+   occlusion_query_readback_.Reset();
+@@ -4916,7 +4970,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
+ }
+ 
+ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
+-  DisableHostOcclusionQueries();
++  DisableHostOcclusionQueries("other");
+ 
+   if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
+     occlusion_query_readback_->Unmap(0, nullptr);
+@@ -4934,7 +4988,66 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
+   return true;
+ }
+ 
+-void D3D12CommandProcessor::DisableHostOcclusionQueries() {
++// Ends the currently outstanding host occlusion query and drops its result,
++// leaving the query machinery available for the next Begin. Used when the guest
++// starts a new query before ending the previous one (Perfect Dark does this),
++// which D3D12 cannot express as nested queries.
++void D3D12CommandProcessor::CloseActiveOcclusionQuery() {
++  if (!active_occlusion_query_.valid || !occlusion_query_heap_) {
++    active_occlusion_query_ = {};
++    return;
++  }
++  uint32_t address = active_occlusion_query_.sample_count_address;
++  uint32_t host_index = active_occlusion_query_.host_index;
++  active_occlusion_query_ = {};
++  if (BeginSubmission(true)) {
++    deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                       host_index);
++    // Keep it so the guest's later End for this address still gets a real
++    // count. The samples it recorded are exactly the draws the guest issued
++    // before starting the next query, which is what it is asking about.
++    closed_occlusion_queries_[address] = host_index;
++  }
++}
++
++// Resolves an already-ended host query and writes the count into the guest's
++// sample-count block.
++bool D3D12CommandProcessor::ResolveOcclusionQueryToGuest(
++    uint32_t host_index, xenos::xe_gpu_depth_sample_counts* sample_counts) {
++  if (!occlusion_query_heap_ || !occlusion_query_readback_) {
++    return false;
++  }
++  if (!BeginSubmission(true)) {
++    return false;
++  }
++  deferred_command_list_.D3DResolveQueryData(
++      occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
++      occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
++  if (!EndSubmission(false)) {
++    return false;
++  }
++  uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
++  CheckSubmissionFence(query_submission);
++  if (submission_completed_ < query_submission) {
++    return false;
++  }
++  if (!occlusion_query_readback_mapping_) {
++    return false;
++  }
++  uint64_t samples = NormalizeOcclusionSamples(occlusion_query_readback_mapping_[host_index]);
++  WriteGuestOcclusionResult(sample_counts, samples);
++  return true;
++}
++
++void D3D12CommandProcessor::DisableHostOcclusionQueries(const char* reason) {
++  // TEMP_OCCL_DIAG: this permanently switches the guest to fake sample
++  // counts, which makes occlusion-queried lens flares always report
++  // "visible" - i.e. light glares drawn through walls.
++  if (occlusion_query_resources_available_) {
++    REXGPU_WARN("D3D12CommandProcessor: host occlusion queries DISABLED ({}) - "
++                "flares will use fake sample counts from now on",
++                reason ? reason : "unspecified");
++  }
+   if (active_occlusion_query_.valid && occlusion_query_heap_) {
+     uint32_t host_index = active_occlusion_query_.host_index;
+     // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
+@@ -4949,6 +5062,13 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+     active_occlusion_query_ = {};
+   }
+   occlusion_query_cursor_ = 0;
++  occlusion_running_total_ = 0;
++  occlusion_pending_.clear();
++  occlusion_frame_slots_.clear();
++  occlusion_snapshot_marks_.clear();
++  occlusion_snapshot_addrs_.clear();
++  occlusion_last_published_ = 0;
++  closed_occlusion_queries_.clear();
+   occlusion_query_resources_available_ = false;
+ }
+ 
+@@ -4959,7 +5079,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
+   if (active_occlusion_query_.valid) {
+     REXGPU_WARN(
+         "D3D12CommandProcessor: Occlusion query begin issued while another query is active");
+-    DisableHostOcclusionQueries();
++    DisableHostOcclusionQueries("begin while another query active");
+     return false;
+   }
+ 
+@@ -5036,7 +5156,11 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
+   if (!sample_counts) {
+     return;
+   }
+-  uint32_t clamped = samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
++  // WRAP, do not clamp. These counters are snapshots of a free-running
++  // hardware counter that the guest subtracts pairwise; clamping at
++  // UINT32_MAX makes every later snapshot identical, so every delta is 0
++  // and every occlusion-tested effect reads as fully hidden.
++  uint32_t clamped = uint32_t(samples & 0xFFFFFFFFull);
+   sample_counts->Total_A = clamped;
+   sample_counts->Total_B = 0;
+   sample_counts->ZPass_A = clamped;
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 3877b1a..76cbe77 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -80,6 +80,10 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+ 
+ GraphicsSystem::~GraphicsSystem() = default;
+ 
++uint64_t GraphicsSystem::guest_frame_count() const {
++  return command_processor_ ? command_processor_->guest_frame_count() : 0;
++}
++
+ X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
+   if (presenter_) {
+     return X_STATUS_SUCCESS;
+@@ -348,6 +352,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
+   command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
+ }
+ 
++bool GraphicsSystem::ReinitializeContext() {
++  if (!command_processor_) {
++    return false;
++  }
++
++  rex::thread::Fence fence;
++  bool success = false;
++
++  command_processor_->CallInThread([&] {
++    success = command_processor_->ReinitializeContext();
++    fence.Signal();
++  });
++
++  fence.Wait();
++  return success;
++}
+ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                              uint32_t title_id, bool blocking) {
+   if (!REXCVAR_GET(store_shaders)) {
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index e132acb..3819a3c 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -57,6 +57,10 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+   }
+ }
+ 
++void InputSystem::SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback) {
++  button_filter_callback_ = std::move(callback);
++}
++
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
+@@ -120,6 +124,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  if (button_filter_callback_) {
++    merged.gamepad.buttons = button_filter_callback_(merged.gamepad.buttons);
++  }
++
+   if (out_state) {
+     *out_state = merged;
+   }
+@@ -147,16 +155,25 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+   SCOPE_profile_cpu_f("hid");
+ 
+   bool any_connected = false;
++  bool any_polled = false;
+   for (auto& driver : drivers_) {
+     X_RESULT result = driver->GetKeystroke(user_index, flags, out_keystroke);
+     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+       any_connected = true;
+     }
+-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
++    if (result == X_ERROR_SUCCESS) {
+       return result;
+     }
++    if (result == X_ERROR_EMPTY) {
++      // EMPTY only means "no keystroke right now" for this driver; keep
++      // polling the remaining drivers. An idle controller must not mask a
++      // pending keystroke from another driver (for example MnK feeding
++      // keyboard-driven XUI menus).
++      any_polled = true;
++    }
+   }
+-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
++  return (any_connected || any_polled) ? X_ERROR_EMPTY
++                                       : X_ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index cff5b1a..48987fc 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -11,6 +11,7 @@
+ #include <rex/input/mnk/mnk_input_driver.h>
+ 
+ #include <rex/cvar.h>
++#include <rex/logging/macros.h>
+ #include <rex/input/input.h>
+ #include <rex/logging.h>
+ #include <rex/ui/keybinds.h>
+@@ -29,6 +30,10 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller
+ REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
++REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert mouse Y axis");
++REXCVAR_DEFINE_BOOL(mnk_direct_look, false, "Input",
++                    "Hand raw mouse deltas to the host for direct aim injection instead of\n"
++                    "emulating the right thumbstick");
+ 
+ REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
+@@ -55,12 +60,18 @@ REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide but
+ 
+ namespace rex::input::mnk {
+ 
++MnkInputDriver* MnkInputDriver::active_instance_ = nullptr;
++MnkInputDriver::LookDeltaSink MnkInputDriver::look_delta_sink_ = nullptr;
++
++void MnkInputDriver::SetLookDeltaSink(LookDeltaSink sink) { look_delta_sink_ = sink; }
++
+ using rex::ui::VirtualKey;
+ 
+ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
+     : InputDriver(window, window_z_order) {}
+ 
+ MnkInputDriver::~MnkInputDriver() {
++  if (active_instance_ == this) active_instance_ = nullptr;
+   // Detach handled by OnClosing; if window outlives the driver, clean up here.
+   if (attached_window_) {
+     attached_window_->RemoveInputListener(this);
+@@ -70,6 +81,7 @@ MnkInputDriver::~MnkInputDriver() {
+ }
+ 
+ X_STATUS MnkInputDriver::Setup() {
++  active_instance_ = this;
+   REXLOG_INFO("MnK input driver initialized");
+   return X_STATUS_SUCCESS;
+ }
+@@ -103,14 +115,78 @@ bool MnkInputDriver::IsEnabled() const {
+   return REXCVAR_GET(mnk_mode);
+ }
+ 
+-static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
+-  VirtualKey vk = rex::ui::ParseVirtualKey(cvar_val);
++static bool IsSingleBindPressed(const bool (&key_down)[256], const std::string& name) {
++  VirtualKey vk = rex::ui::ParseVirtualKey(name);
+   if (vk == VirtualKey::kNone)
+     return false;
+   uint16_t idx = static_cast<uint16_t>(vk);
+   return idx < 256 && key_down[idx];
+ }
+ 
++// A bind may list several keys separated by commas ("E,WheelUp"), so one action
++// can sit on both a key and the wheel. Returns true if any of them is down.
++// Wheel entries are handled by the caller, which owns the pending counters.
++static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
++  size_t start = 0;
++  while (start <= cvar_val.size()) {
++    size_t comma = cvar_val.find(',', start);
++    std::string one = cvar_val.substr(start, comma == std::string::npos ? std::string::npos
++                                                                       : comma - start);
++    while (!one.empty() && one.front() == ' ') one.erase(one.begin());
++    while (!one.empty() && one.back() == ' ') one.pop_back();
++    if (!one.empty() && IsSingleBindPressed(key_down, one))
++      return true;
++    if (comma == std::string::npos)
++      break;
++    start = comma + 1;
++  }
++  return false;
++}
++
++static bool BindMentions(const std::string& cvar_val, const char* token) {
++  return cvar_val.find(token) != std::string::npos;
++}
++
++// XUI menus and "press A" screens consume XamInputGetKeystroke, whose events
++// carry XInput pad virtual keys rather than the X_INPUT_STATE bitfield. Map a
++// pressed key onto the pad key of whichever controller bind it satisfies so
++// keyboard presses reach those consumers. Returns 0 when nothing matches.
++static uint16_t PadVirtualKeyForPressed(VirtualKey pressed) {
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_a)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadA);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_b)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadB);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_x)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadX);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_y)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadY);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_start)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadStart);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_back)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadBack);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_up)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadDpadUp);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_down)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadDpadDown);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_left)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadDpadLeft);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_right)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadDpadRight);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_left_shoulder)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadLShoulder);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_right_shoulder)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadRShoulder);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_lstick_press)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadLThumbPress);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_rstick_press)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadRThumbPress);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_left_trigger)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadLTrigger);
++  if (rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_right_trigger)) == pressed)
++    return static_cast<uint16_t>(VirtualKey::kXInputPadRTrigger);
++  return 0;
++}
++
+ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                          X_INPUT_CAPABILITIES* out_caps) {
+   if (!IsEnabled() || user_index != UserIndex()) {
+@@ -151,26 +227,44 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+ 
+   std::lock_guard lock(state_mutex_);
+ 
++  // Take at most one wheel notch per poll so a fast scroll still produces one
++  // discrete press per notch rather than being collapsed into a single frame.
++  const bool wheel_up = wheel_up_pending_ > 0;
++  const bool wheel_down = wheel_down_pending_ > 0;
++  bool wheel_up_used = false;
++  bool wheel_down_used = false;
++  auto bind_active = [&](const std::string& bind) {
++    if (wheel_up && BindMentions(bind, "WheelUp")) {
++      wheel_up_used = true;
++      return true;
++    }
++    if (wheel_down && BindMentions(bind, "WheelDown")) {
++      wheel_down_used = true;
++      return true;
++    }
++    return IsBindPressed(key_down_, bind);
++  };
++
+   uint16_t buttons = 0;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
++  if (bind_active(REXCVAR_GET(keybind_a)))
+     buttons |= X_INPUT_GAMEPAD_A;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
++  if (bind_active(REXCVAR_GET(keybind_b)))
+     buttons |= X_INPUT_GAMEPAD_B;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
++  if (bind_active(REXCVAR_GET(keybind_x)))
+     buttons |= X_INPUT_GAMEPAD_X;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
++  if (bind_active(REXCVAR_GET(keybind_y)))
+     buttons |= X_INPUT_GAMEPAD_Y;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
++  if (bind_active(REXCVAR_GET(keybind_left_shoulder)))
+     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
++  if (bind_active(REXCVAR_GET(keybind_right_shoulder)))
+     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
++  if (bind_active(REXCVAR_GET(keybind_lstick_press)))
+     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
++  if (bind_active(REXCVAR_GET(keybind_rstick_press)))
+     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
++  if (bind_active(REXCVAR_GET(keybind_back)))
+     buttons |= X_INPUT_GAMEPAD_BACK;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
++  if (bind_active(REXCVAR_GET(keybind_start)))
+     buttons |= X_INPUT_GAMEPAD_START;
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+     buttons |= X_INPUT_GAMEPAD_GUIDE;
+@@ -183,26 +277,62 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+ 
+-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
++  uint8_t lt = bind_active(REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
++  uint8_t rt = bind_active(REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+ 
+   int32_t lx = 0;
+   int32_t ly = 0;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
++  // Mirror the D-pad binds onto the left stick axes: some titles (Aegis Wing)
++  // navigate XUI menus from stick deflection alone and ignore the D-pad, so
++  // the keyboard D-pad could not move menu focus. The D-pad bitfield is still
++  // reported for titles that sample it.
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)) ||
++      IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+     lx -= INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)) ||
++      IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+     lx += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)) ||
++      IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+     ly += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)) ||
++      IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+     ly -= INT16_MAX;
+ 
+-  double sensitivity = REXCVAR_GET(mnk_sensitivity);
+-  constexpr double kBaseScale = 200.0;
+-  int32_t rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
+-  int32_t ry = static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+-  mouse_dx_ = 0;
+-  mouse_dy_ = 0;
++  int32_t rx = 0;
++  int32_t ry = 0;
++  if (!REXCVAR_GET(mnk_direct_look)) {
++    double sensitivity = REXCVAR_GET(mnk_sensitivity);
++    constexpr double kBaseScale = 200.0;
++    const double y_sign = REXCVAR_GET(mnk_invert_y) ? 1.0 : -1.0;
++    ry = static_cast<int32_t>(y_sign * mouse_dy_ * sensitivity * kBaseScale);
++    rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
++    mouse_dx_ = 0;
++    mouse_dy_ = 0;
++  }
++  // In direct-look mode hand the deltas straight to the sink, on this thread,
++  // so aim is applied exactly once per guest input poll.
++  int32_t look_dx = 0;
++  int32_t look_dy = 0;
++  if (REXCVAR_GET(mnk_direct_look)) {
++    look_dx = mouse_dx_;
++    look_dy = mouse_dy_;
++    mouse_dx_ = 0;
++    mouse_dy_ = 0;
++  }
++
++  // A real stick cannot leave the unit circle, but two keys each deflecting an
++  // axis fully give a vector of magnitude 1.41 - so holding W+D walked about 41%
++  // faster than W alone. Scale diagonals back onto the circle.
++  if (lx != 0 && ly != 0) {
++    const double mag = std::sqrt(double(lx) * double(lx) + double(ly) * double(ly));
++    const double limit = double(INT16_MAX);
++    if (mag > limit) {
++      const double scale = limit / mag;
++      lx = int32_t(double(lx) * scale);
++      ly = int32_t(double(ly) * scale);
++    }
++  }
+ 
+   auto clamp16 = [](int32_t v) -> int16_t {
+     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
+@@ -220,6 +350,13 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     out_state->gamepad.thumb_rx = clamp16(rx);
+     out_state->gamepad.thumb_ry = clamp16(ry);
+   }
++
++  if (wheel_up_used && wheel_up_pending_ > 0) --wheel_up_pending_;
++  if (wheel_down_used && wheel_down_pending_ > 0) --wheel_down_pending_;
++
++  if ((look_dx || look_dy) && look_delta_sink_) {
++    look_delta_sink_(look_dx, look_dy);
++  }
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -247,6 +384,12 @@ X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
+ }
+ 
+ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
++  // Bound the queue: if the guest stops polling, drop the oldest events
++  // instead of growing without limit.
++  constexpr size_t kMaxQueuedKeystrokes = 64;
++  if (keystroke_queue_.size() >= kMaxQueuedKeystrokes) {
++    keystroke_queue_.pop();
++  }
+   X_INPUT_KEYSTROKE ks = {};
+   ks.virtual_key = vk_pad;
+   ks.unicode = 0;
+@@ -284,17 +427,23 @@ void MnkInputDriver::UpdateMouseCapture() {
+     precapture_cursor_visibility_ = attached_window_->GetCursorVisibility();
+     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+     attached_window_->CaptureMouse();
++    use_relative_mouse_ = true;
++    attached_window_->SetRelativeMouseMode(true);
+     // Reset deltas to avoid a spike on capture start
+     mouse_dx_ = 0;
+     mouse_dy_ = 0;
+   } else if (!should_capture && mouse_captured_) {
+     mouse_captured_ = false;
++    if (use_relative_mouse_) {
++      attached_window_->SetRelativeMouseMode(false);
++      use_relative_mouse_ = false;
++    }
+     attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+     attached_window_->ReleaseMouse();
+   }
+ 
+-  // Re-center cursor each frame while captured to prevent edge clamping
+-  if (mouse_captured_) {
++  // Relative mode needs no recentring; only the fallback path does.
++  if (mouse_captured_ && !use_relative_mouse_) {
+     CenterCursor();
+   }
+ }
+@@ -305,12 +454,43 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+   }
+ }
+ 
++void MnkInputDriver::EnqueueBoundPadKeystrokes(VirtualKey pressed, bool down) {
++  // D-pad and left-stick binds surface as the synthetic stick-direction
++  // keystroke: Aegis Wing drives its XUI focus engine from stick keys alone
++  // and does not recognize a press once a D-pad keystroke is interleaved.
++  // D-pad state still reaches GetState consumers through the button bitfield.
++  bool is_up = rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_up)) == pressed ||
++               rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_lstick_up)) == pressed;
++  bool is_down = rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_down)) == pressed ||
++                 rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_lstick_down)) == pressed;
++  bool is_left = rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_left)) == pressed ||
++                 rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_lstick_left)) == pressed;
++  bool is_right = rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_dpad_right)) == pressed ||
++                  rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_lstick_right)) == pressed;
++  if (is_up || is_down || is_left || is_right) {
++    uint16_t stick_vk = is_up     ? static_cast<uint16_t>(VirtualKey::kXInputPadLThumbUp)
++                        : is_down ? static_cast<uint16_t>(VirtualKey::kXInputPadLThumbDown)
++                        : is_left ? static_cast<uint16_t>(VirtualKey::kXInputPadLThumbLeft)
++                                  : static_cast<uint16_t>(VirtualKey::kXInputPadLThumbRight);
++    EnqueueKeystroke(stick_vk, down);
++    return;
++  }
++  if (uint16_t pad_vk = PadVirtualKeyForPressed(pressed)) {
++    EnqueueKeystroke(pad_vk, down);
++  }
++}
++
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+   if (!IsEnabled() || !has_focus_)
+     return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+   SetKeyState(vk, true);
++  // Keyboard presses must also reach XamInputGetKeystroke consumers (XUI
++  // menus), which never sample the GetState bitfield.
++  if (is_active()) {
++    EnqueueBoundPadKeystrokes(e.virtual_key(), true);
++  }
+ }
+ 
+ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+@@ -319,6 +499,9 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+   SetKeyState(vk, false);
++  // Always propagate the release, even if the press was not seen (e.g. the
++  // window lost focus in between), so a key cannot stick down.
++  EnqueueBoundPadKeystrokes(e.virtual_key(), false);
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+@@ -359,10 +542,31 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+   }
+ }
+ 
++void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
++  if (!IsEnabled() || !has_focus_)
++    return;
++  std::lock_guard lock(state_mutex_);
++  int32_t detents = e.scroll_y() / int32_t(rex::ui::MouseEvent::kScrollPerDetent);
++  if (detents > 0) {
++    wheel_up_pending_ += detents;
++  } else if (detents < 0) {
++    wheel_down_pending_ += -detents;
++  }
++}
++
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+   if (!IsEnabled() || !has_focus_)
+     return;
+   std::lock_guard lock(state_mutex_);
++  if (use_relative_mouse_) {
++    // Relative mode reports true deltas, so no warping and nothing lost either
++    // side of it. Differencing absolute positions against a per-poll recentre
++    // delivered movement unevenly - measured as an injection rate wobbling
++    // between 36 and 51/sec instead of a steady 60 - which is felt as jitter.
++    mouse_dx_ += e.rel_x();
++    mouse_dy_ += e.rel_y();
++    return;
++  }
+   int32_t x = e.x();
+   int32_t y = e.y();
+   mouse_dx_ += x - prev_mouse_x_;
+@@ -375,6 +579,10 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   std::lock_guard lock(state_mutex_);
+   has_focus_ = false;
+   std::memset(key_down_, 0, sizeof(key_down_));
++  // Drop queued keystrokes so a press made before losing focus cannot surface
++  // in the guest after focus is gone.
++  std::queue<X_INPUT_KEYSTROKE> empty;
++  keystroke_queue_.swap(empty);
+   mouse_dx_ = 0;
+   mouse_dy_ = 0;
+   if (mouse_captured_ && attached_window_) {
+@@ -389,4 +597,19 @@ void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
+   has_focus_ = true;
+ }
+ 
++bool MnkInputDriver::ConsumeLookDelta(int32_t& dx_out, int32_t& dy_out) {
++  MnkInputDriver* self = active_instance_;
++  if (!self) {
++    dx_out = 0;
++    dy_out = 0;
++    return false;
++  }
++  std::lock_guard lock(self->state_mutex_);
++  dx_out = self->mouse_dx_;
++  dy_out = self->mouse_dy_;
++  self->mouse_dx_ = 0;
++  self->mouse_dy_ = 0;
++  return true;
++}
++
+ }  // namespace rex::input::mnk
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..4938474 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -23,6 +23,7 @@ set(REXKERNEL_SOURCES
+     xam/xam_video.cpp
+     xam/xam_voice.cpp
+     xam/xam_misc.cpp
++    xam/local_leaderboards.cpp
+     xam/apps/xam_app.cpp
+     xam/apps/xgi_app.cpp
+     xam/apps/xlivebase_app.cpp
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index 85c045c..b3dc55a 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -10,7 +10,10 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xgi_app.h>
++#include <rex/kernel/xam/local_leaderboards.h>
+ #include <rex/logging.h>
++
++#include <vector>
+ #include <rex/thread.h>
+ 
+ namespace rex {
+@@ -328,20 +331,57 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
+                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
++      if (!xuids_ptr || !specs_ptr || !results_ptr) {
++        return X_E_INVALIDARG;
++      }
+ 
++      // Answered from the local leaderboards (see local_leaderboards.h).
++      std::vector<uint64_t> xuids;
++      auto xuid_data = memory_->TranslateVirtual(xuids_ptr);
++      for (uint32_t i = 0; i < xuids_count; ++i) {
++        xuids.push_back(memory::load_and_swap<uint64_t>(xuid_data + i * 8));
++      }
++      auto results = leaderboards::QueryPlayers(
++          leaderboards::ReadSpecs(memory_->TranslateVirtual(specs_ptr), specs_count), xuids);
++      if (results.size() > results_size) {
++        REXKRNL_WARN("XUserReadStats: results need {} bytes, buffer holds {}", results.size(),
++                     results_size);
++        return X_E_FAIL;
++      }
++      results.Write(memory_->TranslateVirtual(results_ptr), results_ptr);
+       return X_E_SUCCESS;
+     }
+     case 0x000B0025: {
+-      assert_true(!buffer_length || buffer_length == 20);
+-
++      // { u32 session; u32 pad; u64 xuid; u32 view_count; u32 views_ptr }
++      // views: XSESSION_VIEW_PROPERTIES { u32 view_id; u32 count; u32 ptr }
++      // properties: XUSER_PROPERTY { u32 id; pad; XUSER_DATA }, 24 bytes,
++      // with the XUSER_DATA type at +8 and its value at +16.
+       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
+-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
+-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
++      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 8);
++      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 16);
++      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
+ 
+-      REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
++      REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {}, {:08X})", obj_ptr, xuid, num_views,
+                     views_ptr);
+-
++      for (uint32_t v = 0; v < num_views && views_ptr; ++v) {
++        auto view = memory_->TranslateVirtual(views_ptr + v * 12);
++        uint32_t view_id = memory::load_and_swap<uint32_t>(view + 0);
++        uint32_t num_properties = memory::load_and_swap<uint32_t>(view + 4);
++        uint32_t properties_ptr = memory::load_and_swap<uint32_t>(view + 8);
++        std::vector<leaderboards::Property> properties;
++        for (uint32_t p = 0; p < num_properties && properties_ptr; ++p) {
++          auto data = memory_->TranslateVirtual(properties_ptr + p * 24);
++          leaderboards::Property property;
++          property.id = memory::load_and_swap<uint32_t>(data + 0);
++          property.value.type = data[8];
++          // 32-bit values (int32, float) fill the first half of the union.
++          property.value.bits = property.value.type == 1 || property.value.type == 5
++                                    ? memory::load_and_swap<uint32_t>(data + 16)
++                                    : memory::load_and_swap<uint64_t>(data + 16);
++          properties.push_back(property);
++        }
++        leaderboards::RecordStats(view_id, xuid, properties);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0026: {
+diff --git a/src/kernel/xam/apps/xlivebase_app.cpp b/src/kernel/xam/apps/xlivebase_app.cpp
+index 3593403..266e04c 100644
+--- a/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xlivebase_app.h>
++#include <rex/kernel/xam/local_leaderboards.h>
+ #include <rex/logging.h>
+ #include <rex/thread.h>
+ 
+@@ -51,13 +52,38 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       return 0x80151802;  // ERROR_CONNECTION_INVALID
+     }
+     case 0x00058020: {
+-      // 0x00058004 is called right before this.
+-      // We should create a XamEnumerate-able empty list here, but I'm not
+-      // sure of the format.
+-      // buffer_length seems to be the same ptr sent to 0x00058004.
+-      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) unimplemented", buffer_ptr,
++      // XFriendsCreateEnumerator: 0x00058004 is called right before this.
++      // buffer_ptr is the enumerator the title created for the list, and
++      // buffer_length points at its parameter block: 16-byte slots whose
++      // value (at +8) points at the user index, starting index and friend
++      // count, then at the title's pcbBuffer and phEnum outputs. There's no
++      // friends list offline, so the enumerator is handed back registered as
++      // empty (XamEnumerate then reports no items) instead of failing -
++      // friends-based screens such as a Friends leaderboard keep working
++      // with just the local player.
++      constexpr uint32_t kFriendSize = 196;  // XONLINE_FRIEND
++      if (buffer_length) {
++        auto slot = [&](uint32_t index) {
++          return uint32_t(memory::load_and_swap<uint64_t>(
++              memory_->TranslateVirtual(buffer_length + index * 16 + 8)));
++        };
++        uint32_t count_ptr = slot(2);
++        uint32_t size_ptr = slot(3);
++        uint32_t handle_ptr = slot(4);
++        uint32_t count =
++            count_ptr ? memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(count_ptr)) : 0;
++        if (size_ptr) {
++          memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(size_ptr),
++                                           (count ? count : 1) * kFriendSize);
++        }
++        if (handle_ptr) {
++          memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(handle_ptr), buffer_ptr);
++        }
++      }
++      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) - no friends", buffer_ptr,
+                     buffer_length);
+-      return X_E_FAIL;
++      leaderboards::RegisterEmptyEnumeration(buffer_ptr);
++      return X_E_SUCCESS;
+     }
+     case 0x00058023: {
+       REXKRNL_DEBUG(
+diff --git a/src/kernel/xam/local_leaderboards.cpp b/src/kernel/xam/local_leaderboards.cpp
+new file mode 100644
+index 0000000..6414ca2
+--- /dev/null
++++ b/src/kernel/xam/local_leaderboards.cpp
+@@ -0,0 +1,544 @@
++/**
++ * @file        kernel/xam/local_leaderboards.cpp
++ * @brief       Offline Xbox LIVE leaderboards (see local_leaderboards.h).
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/kernel/xam/local_leaderboards.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <set>
++#include <sstream>
++
++#include <fmt/format.h>
++#include <rex/logging.h>
++#include <rex/memory.h>
++#include <rex/runtime.h>
++#include <rex/system/kernel_state.h>
++#include <rex/system/util/xdbf_utils.h>
++#include <rex/system/xam/user_profile.h>
++
++namespace rex::kernel::xam::leaderboards {
++namespace {
++
++// XUSER_DATA types.
++constexpr uint8_t kTypeInt32 = 1;
++constexpr uint8_t kTypeInt64 = 2;
++constexpr uint8_t kTypeDouble = 3;
++constexpr uint8_t kTypeUnicode = 4;
++constexpr uint8_t kTypeFloat = 5;
++constexpr uint8_t kTypeBinary = 6;
++constexpr uint8_t kTypeNull = 0xFF;
++
++// Reserved column attributes.
++constexpr uint16_t kAttributeRank = 0xFFFF;
++constexpr uint16_t kAttributeRating = 0xFFFE;
++
++// Guest structure sizes: XUSER_STATS_SPEC, XUSER_STATS_READ_RESULTS,
++// XUSER_STATS_VIEW, XUSER_STATS_ROW (8-byte aligned, 16-char gamertag) and
++// XUSER_STATS_COLUMN (the XUSER_DATA value sits at +16).
++constexpr uint32_t kSpecSize = 136;
++constexpr uint32_t kMaxSpecColumns = 64;
++constexpr uint32_t kHeaderSize = 8;
++constexpr uint32_t kViewSize = 16;
++constexpr uint32_t kRowSize = 48;
++constexpr uint32_t kColumnSize = 24;
++constexpr size_t kGamertagSize = 16;
++
++constexpr size_t kMaxEntriesPerView = 100;
++constexpr uint32_t kXvc2Magic = 0x58564332;  // "XVC2"
++constexpr uint32_t kXpbmMagic = 0x5850424D;  // "XPBM"
++
++uint32_t ReadBe32(const uint8_t* p) { return memory::load_and_swap<uint32_t>(p); }
++uint16_t ReadBe16(const uint8_t* p) { return memory::load_and_swap<uint16_t>(p); }
++
++// A property's data type is the top nibble of its id.
++uint8_t PropertyType(uint32_t property_id) { return uint8_t(property_id >> 28); }
++
++int64_t ToInt64(const UserData& value) {
++  switch (value.type) {
++    case kTypeInt32:
++      return int32_t(uint32_t(value.bits));
++    case kTypeFloat: {
++      uint32_t raw = uint32_t(value.bits);
++      float f;
++      std::memcpy(&f, &raw, sizeof(f));
++      return int64_t(f);
++    }
++    case kTypeDouble: {
++      double d;
++      std::memcpy(&d, &value.bits, sizeof(d));
++      return int64_t(d);
++    }
++    default:
++      return int64_t(value.bits);
++  }
++}
++
++struct Entry {
++  uint64_t xuid = 0;
++  std::string gamertag;
++  int64_t rating = 0;
++  int64_t time = 0;
++  std::vector<Property> properties;
++
++  const Property* Find(uint32_t id) const {
++    for (const auto& property : properties) {
++      if (property.id == id) return &property;
++    }
++    return nullptr;
++  }
++};
++
++// One leaderboard as the title defines it: which property feeds each column
++// attribute, and which one is the rating the board is sorted by.
++struct ViewSchema {
++  std::map<uint16_t, uint32_t> column_properties;
++  uint32_t rating_property = 0;
++};
++
++// The SPA "XVC2" section (big-endian):
++//   "XVC2", u32 version, u32 size, u16 shared view count
++//   per shared view: u16 column count, u16 row count, 8 reserved bytes,
++//     (columns + rows) field entries - u32 entry size, u32 property id,
++//     u32 flags, u16 attribute id, ... - then an "XPBM" property bitmap
++//     (u32 magic, u32 version, u32 size, 6 reserved bytes, u16 count, ids)
++//   u16 view count; per view: u32 view id, u32 flags, u16 shared view
++//     index, u16 string id, 4 reserved bytes
++std::map<uint32_t, ViewSchema> ParseViewSchema(const uint8_t* data, size_t size) {
++  std::map<uint32_t, ViewSchema> views;
++  const uint8_t* p = data;
++  const uint8_t* end = data + size;
++  auto have = [&](size_t n) { return size_t(end - p) >= n; };
++
++  if (!have(14) || ReadBe32(p) != kXvc2Magic) return views;
++  uint16_t shared_count = ReadBe16(p + 12);
++  p += 14;
++
++  std::vector<ViewSchema> shared;
++  for (uint16_t s = 0; s < shared_count; ++s) {
++    if (!have(12)) return {};
++    uint32_t field_count = uint32_t(ReadBe16(p)) + ReadBe16(p + 2);
++    uint16_t column_count = ReadBe16(p);
++    p += 12;
++    ViewSchema view;
++    for (uint32_t f = 0; f < field_count; ++f) {
++      if (!have(16)) return {};
++      uint32_t entry_size = ReadBe32(p);
++      if (entry_size < 16 || !have(entry_size)) return {};
++      if (f < column_count) {
++        uint32_t property_id = ReadBe32(p + 4);
++        uint16_t attribute_id = ReadBe16(p + 12);
++        view.column_properties[attribute_id] = property_id;
++        if (attribute_id == kAttributeRating) view.rating_property = property_id;
++      }
++      p += entry_size;
++    }
++    if (!have(20) || ReadBe32(p) != kXpbmMagic) return {};
++    size_t bitmap_bytes = 20 + size_t(ReadBe16(p + 18)) * 4;
++    if (!have(bitmap_bytes)) return {};
++    p += bitmap_bytes;
++    shared.push_back(std::move(view));
++  }
++
++  if (!have(2)) return {};
++  uint16_t view_count = ReadBe16(p);
++  p += 2;
++  for (uint16_t v = 0; v < view_count; ++v) {
++    if (!have(16)) return {};
++    uint32_t view_id = ReadBe32(p);
++    uint16_t shared_index = ReadBe16(p + 8);
++    if (shared_index < shared.size()) views[view_id] = shared[shared_index];
++    p += 16;
++  }
++  return views;
++}
++
++std::string HexEncode(const std::string& text) {
++  if (text.empty()) return "-";
++  std::string out;
++  for (unsigned char c : text) out += fmt::format("{:02X}", c);
++  return out;
++}
++
++std::string HexDecode(const std::string& hex) {
++  std::string out;
++  if (hex == "-") return out;
++  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
++    out += char(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16));
++  }
++  return out;
++}
++
++// Best first; among equal ratings, the earlier entry ranks higher.
++void SortEntries(std::vector<Entry>& entries) {
++  std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
++    return a.rating != b.rating ? a.rating > b.rating : a.time < b.time;
++  });
++  if (entries.size() > kMaxEntriesPerView) entries.resize(kMaxEntriesPerView);
++}
++
++class State {
++ public:
++  static State& Get() {
++    static State state;
++    return state;
++  }
++
++  std::mutex mutex;
++
++  // Everything below is guarded by `mutex`.
++  std::map<uint32_t, std::vector<Entry>> views;
++  std::map<uint32_t, ViewSchema> schema;
++  std::set<uint32_t> empty_enumerations;
++
++  void EnsureLoaded() {
++    if (loaded_) return;
++    auto* kernel_state = REX_KERNEL_STATE();
++    if (!kernel_state) return;
++    loaded_ = true;
++
++    uint32_t title_id = kernel_state->title_id();
++    auto db = kernel_state->title_xdbf();
++    if (db.is_valid()) {
++      auto block = db.GetEntry(system::util::XdbfSection::kMetadata, kXvc2Magic);
++      if (block) schema = ParseViewSchema(block.buffer, block.size);
++    }
++
++    auto* runtime = kernel_state->emulator();
++    if (runtime && !runtime->user_data_root().empty()) {
++      path_ = std::filesystem::absolute(runtime->user_data_root()) / "leaderboards" /
++              fmt::format("{:08X}.txt", title_id);
++      Load();
++    }
++    size_t entry_count = 0;
++    for (const auto& [view_id, entries] : views) entry_count += entries.size();
++    REXKRNL_INFO("Local leaderboards: title {:08X} defines {} view(s); {} saved entr{}",
++                 title_id, schema.size(), entry_count, entry_count == 1 ? "y" : "ies");
++  }
++
++  const ViewSchema* FindSchema(uint32_t view_id) const {
++    auto it = schema.find(view_id);
++    return it != schema.end() ? &it->second : nullptr;
++  }
++
++  const std::vector<Entry>& Entries(uint32_t view_id) const {
++    static const std::vector<Entry> kNone;
++    auto it = views.find(view_id);
++    return it != views.end() ? it->second : kNone;
++  }
++
++  // Written to a temporary file first, so a crash can't truncate the list.
++  void Save() const {
++    if (path_.empty()) return;
++    std::error_code ec;
++    std::filesystem::create_directories(path_.parent_path(), ec);
++    auto temp_path = path_;
++    temp_path += ".tmp";
++    {
++      std::ofstream out(temp_path, std::ios::trunc);
++      if (!out) {
++        REXKRNL_WARN("Local leaderboards: could not write {}", temp_path.string());
++        return;
++      }
++      out << "# Local leaderboards: view xuid rating time gamertag(hex) count "
++             "property:type:value...\n";
++      for (const auto& [view_id, entries] : views) {
++        for (const auto& entry : entries) {
++          out << fmt::format("v {} {:016X} {} {} {} {}", view_id, entry.xuid, entry.rating,
++                             entry.time, HexEncode(entry.gamertag), entry.properties.size());
++          for (const auto& property : entry.properties) {
++            out << fmt::format(" {:08X}:{}:{:016X}", property.id, property.value.type,
++                               property.value.bits);
++          }
++          out << '\n';
++        }
++      }
++    }
++    std::filesystem::rename(temp_path, path_, ec);
++    if (ec) {
++      REXKRNL_WARN("Local leaderboards: could not save {}: {}", path_.string(), ec.message());
++    }
++  }
++
++ private:
++  void Load() {
++    std::ifstream in(path_);
++    std::string line;
++    while (std::getline(in, line)) {
++      if (line.empty() || line[0] == '#') continue;
++      std::istringstream fields(line);
++      std::string tag, xuid, gamertag;
++      uint32_t view_id = 0;
++      size_t count = 0;
++      Entry entry;
++      if (!(fields >> tag >> view_id >> xuid >> entry.rating >> entry.time >> gamertag >> count) ||
++          tag != "v" || count > 256) {
++        continue;
++      }
++      entry.xuid = std::strtoull(xuid.c_str(), nullptr, 16);
++      entry.gamertag = HexDecode(gamertag);
++      for (size_t i = 0; i < count; ++i) {
++        std::string token;
++        unsigned int id = 0, type = 0;
++        unsigned long long bits = 0;
++        if (!(fields >> token) || std::sscanf(token.c_str(), "%x:%u:%llx", &id, &type, &bits) != 3) {
++          break;
++        }
++        entry.properties.push_back({id, {uint8_t(type), bits}});
++      }
++      views[view_id].push_back(std::move(entry));
++    }
++    for (auto& [view_id, entries] : views) SortEntries(entries);
++  }
++
++  bool loaded_ = false;
++  std::filesystem::path path_;
++};
++
++std::string PlayerGamertag(uint64_t xuid) {
++  auto* kernel_state = REX_KERNEL_STATE();
++  if (!kernel_state) return {};
++  const auto& profile = kernel_state->user_profile();
++  if (!profile || (xuid && profile->xuid() != xuid)) return {};
++  return profile->name();
++}
++
++UserData ColumnValue(const Entry* entry, uint32_t rank, const ViewSchema* schema,
++                     uint16_t attribute) {
++  if (attribute == kAttributeRank) return {kTypeInt32, rank};
++  if (attribute == kAttributeRating) {
++    return {kTypeInt64, entry ? uint64_t(entry->rating) : 0};
++  }
++  if (schema) {
++    auto it = schema->column_properties.find(attribute);
++    if (it != schema->column_properties.end()) {
++      if (entry) {
++        if (const auto* property = entry->Find(it->second)) return property->value;
++      }
++      return {PropertyType(it->second), 0};
++    }
++  }
++  return {kTypeNull, 0};
++}
++
++ResultSet::Row MakeRow(const Entry* entry, uint64_t xuid, uint32_t rank, const StatsSpec& spec,
++                       const ViewSchema* schema) {
++  ResultSet::Row row;
++  row.xuid = entry ? entry->xuid : xuid;
++  row.rank = rank;
++  row.rating = entry ? entry->rating : 0;
++  row.gamertag = entry && !entry->gamertag.empty() ? entry->gamertag : PlayerGamertag(row.xuid);
++  for (uint16_t attribute : spec.columns) {
++    row.columns.emplace_back(attribute, ColumnValue(entry, rank, schema, attribute));
++  }
++  return row;
++}
++
++}  // namespace
++
++uint32_t ResultSet::size() const {
++  size_t size = kHeaderSize + kViewSize * views_.size();
++  for (const auto& view : views_) {
++    for (const auto& row : view.rows) size += kRowSize + kColumnSize * row.columns.size();
++  }
++  return uint32_t(size);
++}
++
++void ResultSet::Write(uint8_t* host, uint32_t guest_address) const {
++  std::memset(host, 0, size());
++  memory::store_and_swap<uint32_t>(host + 0, uint32_t(views_.size()));
++  memory::store_and_swap<uint32_t>(host + 4, views_.empty() ? 0 : guest_address + kHeaderSize);
++
++  size_t row_count = 0;
++  for (const auto& view : views_) row_count += view.rows.size();
++  uint32_t row_offset = kHeaderSize + kViewSize * uint32_t(views_.size());
++  uint32_t column_offset = row_offset + kRowSize * uint32_t(row_count);
++
++  for (size_t v = 0; v < views_.size(); ++v) {
++    const auto& view = views_[v];
++    uint8_t* view_ptr = host + kHeaderSize + kViewSize * v;
++    memory::store_and_swap<uint32_t>(view_ptr + 0, view.view_id);
++    memory::store_and_swap<uint32_t>(view_ptr + 4, view.total_rows);
++    memory::store_and_swap<uint32_t>(view_ptr + 8, uint32_t(view.rows.size()));
++    memory::store_and_swap<uint32_t>(view_ptr + 12,
++                                     view.rows.empty() ? 0 : guest_address + row_offset);
++    for (const auto& row : view.rows) {
++      uint8_t* row_ptr = host + row_offset;
++      memory::store_and_swap<uint64_t>(row_ptr + 0, row.xuid);
++      memory::store_and_swap<uint32_t>(row_ptr + 8, row.rank);
++      memory::store_and_swap<uint64_t>(row_ptr + 16, uint64_t(row.rating));
++      std::memcpy(row_ptr + 24, row.gamertag.data(),
++                  std::min(row.gamertag.size(), kGamertagSize - 1));
++      memory::store_and_swap<uint32_t>(row_ptr + 40, uint32_t(row.columns.size()));
++      memory::store_and_swap<uint32_t>(row_ptr + 44,
++                                       row.columns.empty() ? 0 : guest_address + column_offset);
++      for (const auto& [attribute, value] : row.columns) {
++        uint8_t* column_ptr = host + column_offset;
++        memory::store_and_swap<uint16_t>(column_ptr + 0, attribute);
++        // String and binary values would need guest buffers; report none.
++        bool pointer_type = value.type == kTypeUnicode || value.type == kTypeBinary;
++        column_ptr[8] = pointer_type ? kTypeNull : value.type;
++        if (value.type == kTypeInt32 || value.type == kTypeFloat) {
++          memory::store_and_swap<uint32_t>(column_ptr + 16, uint32_t(value.bits));
++        } else if (value.type != kTypeNull && !pointer_type) {
++          memory::store_and_swap<uint64_t>(column_ptr + 16, value.bits);
++        }
++        column_offset += kColumnSize;
++      }
++      row_offset += kRowSize;
++    }
++  }
++}
++
++std::vector<StatsSpec> ReadSpecs(const uint8_t* specs, uint32_t count) {
++  std::vector<StatsSpec> result;
++  for (uint32_t s = 0; s < count && specs; ++s) {
++    const uint8_t* spec = specs + s * kSpecSize;
++    StatsSpec parsed;
++    parsed.view_id = ReadBe32(spec + 0);
++    uint32_t columns = std::min(ReadBe32(spec + 4), kMaxSpecColumns);
++    for (uint32_t c = 0; c < columns; ++c) parsed.columns.push_back(ReadBe16(spec + 8 + c * 2));
++    result.push_back(std::move(parsed));
++  }
++  return result;
++}
++
++void RecordStats(uint32_t view_id, uint64_t xuid, const std::vector<Property>& properties) {
++  if (properties.empty()) return;
++  auto& state = State::Get();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  state.EnsureLoaded();
++
++  Entry entry;
++  entry.xuid = xuid;
++  entry.gamertag = PlayerGamertag(xuid);
++  entry.time = int64_t(std::time(nullptr));
++  entry.properties = properties;
++
++  // The rating is the property the title's view sorts by; without a
++  // definition, the first 64-bit value is the usual choice.
++  const Property* rating = nullptr;
++  if (const auto* schema = state.FindSchema(view_id)) rating = entry.Find(schema->rating_property);
++  for (size_t i = 0; !rating && i < entry.properties.size(); ++i) {
++    if (entry.properties[i].value.type == kTypeInt64) rating = &entry.properties[i];
++  }
++  if (!rating) rating = &entry.properties.front();
++  entry.rating = ToInt64(rating->value);
++
++  REXKRNL_INFO("Local leaderboards: view {} recorded rating {} ({} properties)", view_id,
++               entry.rating, entry.properties.size());
++  auto& entries = state.views[view_id];
++  entries.push_back(std::move(entry));
++  SortEntries(entries);
++  state.Save();
++}
++
++ResultSet QueryEnumerator(const std::vector<StatsSpec>& specs, EnumerateBy by, uint64_t pivot,
++                          uint32_t num_rows) {
++  ResultSet results;
++  auto& state = State::Get();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  state.EnsureLoaded();
++
++  for (const auto& spec : specs) {
++    const auto& entries = state.Entries(spec.view_id);
++    const auto* schema = state.FindSchema(spec.view_id);
++    ResultSet::View view;
++    view.view_id = spec.view_id;
++    view.total_rows = uint32_t(entries.size());
++
++    size_t start = 0;
++    switch (by) {
++      case EnumerateBy::kRank:
++        start = pivot ? size_t(pivot - 1) : 0;
++        break;
++      case EnumerateBy::kRating:
++        while (start < entries.size() && entries[start].rating > int64_t(pivot)) ++start;
++        break;
++      case EnumerateBy::kXuid:
++      default:
++        // The page around the player's best entry; the top page when the
++        // player has no entry (every row is local, so there's no one else's
++        // position to fall back on).
++        // Kernel exports receive integer arguments as 32 bits, so the XUID
++        // can arrive with its top half missing; match on what's left.
++        for (size_t i = 0; i < entries.size(); ++i) {
++          bool match = entries[i].xuid == pivot ||
++                       (pivot <= 0xFFFFFFFFull && uint32_t(entries[i].xuid) == uint32_t(pivot));
++          if (!match) continue;
++          size_t before = num_rows ? (num_rows - 1) / 2 : 0;
++          start = i > before ? i - before : 0;
++          if (entries.size() >= num_rows && start + num_rows > entries.size()) {
++            start = entries.size() - num_rows;
++          }
++          break;
++        }
++        break;
++    }
++    for (size_t i = start; i < entries.size() && view.rows.size() < num_rows; ++i) {
++      view.rows.push_back(MakeRow(&entries[i], entries[i].xuid, uint32_t(i + 1), spec, schema));
++    }
++    REXKRNL_DEBUG("Local leaderboards: view {} by {} pivot {:X}: rows {}-{} of {}", spec.view_id,
++                  uint32_t(by), pivot, start + 1, start + view.rows.size(), entries.size());
++    // A view with no rows is left out: some titles read the first row of
++    // every view they get back without checking the row count.
++    if (!view.rows.empty()) {
++      results.views().push_back(std::move(view));
++    }
++  }
++  return results;
++}
++
++ResultSet QueryPlayers(const std::vector<StatsSpec>& specs, const std::vector<uint64_t>& xuids) {
++  ResultSet results;
++  auto& state = State::Get();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  state.EnsureLoaded();
++
++  for (const auto& spec : specs) {
++    const auto& entries = state.Entries(spec.view_id);
++    const auto* schema = state.FindSchema(spec.view_id);
++    ResultSet::View view;
++    view.view_id = spec.view_id;
++    view.total_rows = uint32_t(entries.size());
++    for (uint64_t xuid : xuids) {
++      const Entry* best = nullptr;
++      uint32_t rank = 0;
++      for (size_t i = 0; i < entries.size(); ++i) {
++        if (entries[i].xuid == xuid) {
++          best = &entries[i];
++          rank = uint32_t(i + 1);
++          break;
++        }
++      }
++      view.rows.push_back(MakeRow(best, xuid, rank, spec, schema));
++    }
++    results.views().push_back(std::move(view));
++  }
++  return results;
++}
++
++void RegisterEmptyEnumeration(uint32_t handle) {
++  auto& state = State::Get();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  state.empty_enumerations.insert(handle);
++}
++
++bool IsEmptyEnumeration(uint32_t handle) {
++  auto& state = State::Get();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  return state.empty_enumerations.count(handle) != 0;
++}
++
++}  // namespace rex::kernel::xam::leaderboards
+diff --git a/src/kernel/xam/xam_enum.cpp b/src/kernel/xam/xam_enum.cpp
+index 9dcab94..e8c2877 100644
+--- a/src/kernel/xam/xam_enum.cpp
++++ b/src/kernel/xam/xam_enum.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xtypes.h>
++#include <rex/kernel/xam/local_leaderboards.h>
+ 
+ #if REX_PLATFORM_WIN32
+ #include <rex/platform.h>
+@@ -38,7 +39,21 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
+ 
+   auto e = REX_KERNEL_OBJECTS()->LookupObject<XEnumerator>(handle);
+   if (!e) {
+-    return X_ERROR_INVALID_HANDLE;
++    if (!leaderboards::IsEmptyEnumeration(handle)) {
++      REXKRNL_WARN("XamEnumerate: invalid handle {:08X}", handle);
++      return X_ERROR_INVALID_HANDLE;
++    }
++    // A list there is no data for offline (the friends list): no items.
++    if (items_returned) {
++      *items_returned = 0;
++      return X_ERROR_NO_MORE_FILES;
++    }
++    if (overlapped_ptr) {
++      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
++          overlapped_ptr, X_ERROR_NO_MORE_FILES, X_HRESULT_FROM_WIN32(X_ERROR_NO_MORE_FILES), 0);
++      return X_ERROR_IO_PENDING;
++    }
++    return X_ERROR_NO_MORE_FILES;
+   }
+ 
+   auto run = [e, buffer_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..58b7787 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -25,6 +25,8 @@
+ #include <windows.h>
+ #endif
+ 
++#include <cstdlib>
++
+ #include <fmt/format.h>
+ #include <fmt/xchar.h>
+ 
+@@ -289,8 +291,11 @@ void XamLoaderLaunchTitle_entry(mapped_string raw_name_ptr, u32 flags) {
+ }
+ 
+ void XamLoaderTerminateTitle_entry() {
+-  // This function does not return.
+-  REX_KERNEL_STATE()->TerminateTitle();
++  // Standalone recompilation: there is no Xbox dashboard to return to.
++  // Flush logs and terminate the host process immediately.
++  REXLOG_INFO("Title requested termination; exiting process.");
++  rex::FlushLogging();
++  std::_Exit(0);
+ }
+ 
+ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 5a572ce..cc0148c 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -15,8 +15,12 @@
+ #include <rex/system/flags.h>
+ #include <rex/system/kernel_state.h>
+ 
++#include <functional>
++
+ #include <imgui.h>
+ 
++#include <rex/kernel/xam/ui_hooks.h>
++
+ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+                     "Don't display any UI, using defaults for prompts as needed");
+ #include <rex/kernel/xam/private.h>
+@@ -560,6 +564,48 @@ uint32_t XamShowMessageBoxUIEx_entry() {
+   return 0;
+ }
+ 
++u32 XamShowMarketplaceUI_entry() {
++  const Runtime* emulator = REX_KERNEL_STATE()->emulator();
++  ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
++
++  if (imgui_drawer) {
++    xeXamDispatchDialog<MessageBoxDialog>(
++        new MessageBoxDialog(
++            imgui_drawer,
++            "Downloadable Content",
++            "To install your Boom Boom Rock Pack DLC please exit the game and run "
++            "the Install Boom Boom Rock Pack DLC.bat.",
++            {"OK"},
++            0),
++        [](MessageBoxDialog*) -> X_RESULT { return X_ERROR_SUCCESS; },
++        0);
++  }
++
++  return X_ERROR_SUCCESS;
++}
++
++namespace {
++std::function<void()>& ShowAchievementsUICallbackSlot() {
++  static std::function<void()> callback;
++  return callback;
++}
++}  // namespace
++
++void SetShowAchievementsUICallback(std::function<void()> callback) {
++  ShowAchievementsUICallbackSlot() = std::move(callback);
++}
++
++// XamShowAchievementsUI has no equivalent on PC. Default behavior (no title
++// override registered) is an unchanged stub warning; see ui_hooks.h.
++void XamShowAchievementsUI_entry() {
++  auto& callback = ShowAchievementsUICallbackSlot();
++  if (callback) {
++    callback();
++    return;
++  }
++  REXKRNL_WARN("__imp__XamShowAchievementsUI STUB");
++}
++
+ }  // namespace xam
+ }  // namespace kernel
+ }  // namespace rex
+@@ -572,6 +618,7 @@ REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErr
+ REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
+ REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
+ REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
++REX_EXPORT(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+ 
+ REX_EXPORT_STUB(__imp__XamIsGuideDisabled);
+ REX_EXPORT_STUB(__imp__XamIsMessageBoxActive);
+@@ -583,7 +630,7 @@ REX_EXPORT_STUB(__imp__XamNavigate);
+ REX_EXPORT_STUB(__imp__XamNavigateBack);
+ REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
+ REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
++REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
+ REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
+ REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
+@@ -632,7 +679,6 @@ REX_EXPORT_STUB(__imp__XamShowMarketplaceDownloadItemsUI);
+ REX_EXPORT_STUB(__imp__XamShowMarketplaceGetOrderReceipts);
+ REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUI);
+ REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUIEx);
+-REX_EXPORT_STUB(__imp__XamShowMarketplaceUI);
+ REX_EXPORT_STUB(__imp__XamShowMarketplaceUIEx);
+ REX_EXPORT_STUB(__imp__XamShowMessageBox);
+ REX_EXPORT_STUB(__imp__XamShowMessageComposeUI);
+@@ -694,4 +740,4 @@ REX_EXPORT_STUB(__imp__XamShowVoiceMailUI);
+ REX_EXPORT_STUB(__imp__XamShowVoiceSettingsUI);
+ REX_EXPORT_STUB(__imp__XamShowWhatsOnUI);
+ REX_EXPORT_STUB(__imp__XamShowWordRegisterUI);
+-REX_EXPORT_STUB(__imp__XamSysUiDisableAutoClose);
++REX_EXPORT_STUB(__imp__XamSysUiDisableAutoClose);
+\ No newline at end of file
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..1387eae 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
++#include <rex/kernel/xam/local_leaderboards.h>
++#include <rex/kernel/xam/ui_hooks.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/hook.h>
+@@ -679,6 +681,64 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
+   return X_ERROR_SUCCESS;
+ }
+ 
++namespace {
++
++// XamUserCreateStatsEnumerator's results: one XUSER_STATS_READ_RESULTS,
++// laid out in the title's buffer by the first XamEnumerate.
++class XStatsEnumerator : public XEnumerator {
++ public:
++  XStatsEnumerator(KernelState* kernel_state, leaderboards::ResultSet results)
++      : XEnumerator(kernel_state, 1, results.size()), results_(std::move(results)) {}
++
++  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
++                      uint32_t* written_count) override {
++    if (written_) {
++      return X_ERROR_NO_MORE_FILES;
++    }
++    results_.Write(buffer_data, buffer_ptr);
++    written_ = true;
++    if (written_count) {
++      *written_count = 1;
++    }
++    return X_ERROR_SUCCESS;
++  }
++
++ private:
++  leaderboards::ResultSet results_;
++  bool written_ = false;
++};
++
++}  // namespace
++
++// XUserCreateStatsEnumeratorBy{Xuid,Rank,Rating}, answered from the local
++// leaderboards (see local_leaderboards.h). type: 0 by XUID, 1 by rank, 2 by
++// rating; pivot is the XUID, starting rank or rating.
++u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 type, u64 pivot, u32 num_rows,
++                                       u32 num_specs, u32 specs_ptr,
++                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
++  if (!num_specs || !specs_ptr || !handle_ptr) {
++    return X_ERROR_INVALID_PARAMETER;
++  }
++
++  auto specs = leaderboards::ReadSpecs(
++      REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(specs_ptr), num_specs);
++  auto results = leaderboards::QueryEnumerator(
++      specs, static_cast<leaderboards::EnumerateBy>(uint32_t(type)), uint64_t(pivot),
++      uint32_t(num_rows));
++  if (buffer_size_ptr) {
++    *buffer_size_ptr = results.size();
++  }
++
++  auto e = object_ref<XStatsEnumerator>(
++      new XStatsEnumerator(REX_KERNEL_STATE(), std::move(results)));
++  auto result = e->Initialize(0, 0xFB, 0, 0, 0);
++  if (XFAILED(result)) {
++    return result;
++  }
++  *handle_ptr = e->handle();
++  return X_ERROR_SUCCESS;
++}
++
+ u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u32 out2_ptr,
+                                mapped_u32 out3_ptr) {
+   *out1_ptr = 0xC0DE0001;
+@@ -751,6 +811,7 @@ REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFrien
+ REX_EXPORT(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
+ REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
+            rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
++REX_EXPORT(__imp__XamUserCreateStatsEnumerator, rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
+ REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
+ REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
+ REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
+@@ -761,7 +822,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
+ REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
+ REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
+ REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
+-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
+ REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
+ REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
+ REX_EXPORT_STUB(__imp__XamUserGetAge);
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index 67f7070..aafe09d 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -23,6 +23,11 @@
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/thread_state.h>
+ 
++// TEMP_MENU_SCAN: see the REXCVAR_DECLARE(bool, trace_indirect_calls) note
++// in function_dispatcher.h.
++REXCVAR_DEFINE_BOOL(trace_indirect_calls, false, "Debug",
++                     "Log every guest address resolved through an indirect (function-pointer) call");
++
+ namespace rex::runtime {
+ 
+ namespace {
+@@ -46,6 +51,10 @@ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+   }
+ 
+   if (PPCFunc* func = dispatcher->GetFunction(guest_address)) {
++    // TEMP_MENU_SCAN
++    if (REXCVAR_GET(trace_indirect_calls)) {
++      REXLOG_INFO("[indirect_call] resolved guest address 0x{:08X}", guest_address);
++    }
+     return func;
+   }
+ 
+@@ -70,6 +79,13 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
+   auto* ctx = thread_state->context();
+   auto* previous_thread_state = ThreadState::Get();
+ 
++  // This may run on a native thread that never went through
++  // XThread::Execute (e.g. a host-driven callback/interrupt dispatch), so
++  // its host FP exception mask was never asserted. This recompiler does not
++  // deliver a guest-visible FP exception, so an unmasked trap here would
++  // otherwise crash the process; re-assert the mask defensively.
++  ctx->fpscr.InitHost();
++
+   // Rebind the active guest thread for cross-module callbacks.
+   ThreadState::Bind(thread_state);
+ 
+@@ -138,6 +154,13 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
+   auto* ctx = thread_state->context();
+   assert_true(arg_count <= 5);
+ 
++  // Interrupts can be dispatched on a native thread that never ran
++  // XThread::Execute (e.g. a GPU/present thread invoking a guest interrupt
++  // callback), so its host FP exception mask was never asserted. Re-assert
++  // it here; this recompiler does not deliver a guest-visible FP exception,
++  // so an unmasked trap here would otherwise crash the process.
++  ctx->fpscr.InitHost();
++
+   if (arg_count > 0)
+     ctx->r3.u64 = args[0];
+   if (arg_count > 1)
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index ca7f4e8..a90f9ec 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -713,10 +713,16 @@ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uin
+       "(+{:08X} thunk reserve)",
+       table_base, table_size, code_base, code_base + code_size, kThunkReserveSize);
+ 
+-  if (!heaps_.v80000000.AllocFixed(
+-          table_base, table_size, 0x10000,
+-          memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+-          memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
++  BaseHeap* table_heap = LookupHeap(table_base);
++  if (!table_heap) {
++    REXSYS_ERROR("Failed to allocate function table at {:08X}: no heap covers this address",
++                 table_base);
++    return false;
++  }
++
++  if (!table_heap->AllocFixed(table_base, table_size, 0x10000,
++                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
++                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+     REXSYS_ERROR("Failed to allocate function table at {:08X}", table_base);
+     return false;
+   }
+@@ -757,7 +763,9 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
+   REXSYS_DEBUG("Destroying function table at {:08X}, size {:08X} for code {:08X}-{:08X}",
+                table_base, table_size, logged_code_base, logged_code_base + logged_code_size);
+ 
+-  heaps_.v80000000.Release(table_base);
++  if (BaseHeap* table_heap = LookupHeap(table_base)) {
++    table_heap->Release(table_base);
++  }
+   return true;
+ }
+ 
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+index 0b44e06..73b9e79 100644
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -18,6 +18,8 @@
+ // #include <rex/system/xnet.h>
+ 
+ #include <rex/net/socket.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
+ 
+ // Standard socket types used by Xbox API emulation
+ #if REX_PLATFORM_WIN32
+@@ -31,6 +33,41 @@
+ #include <sys/socket.h>
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(net_loopback_only, true, "Network",
++                    "Bind guest sockets that ask for any address to loopback only, so the "
++                    "game never needs a firewall exception. Turn off for LAN play.");
++
++namespace {
++
++// Binds a socket the guest never bound to 127.0.0.1 on an ephemeral port.
++// Without this, Windows binds it to every adapter the first time it listens,
++// sends or receives - which raises the same firewall prompt as an explicit
++// "any address" bind. Attempted once per socket; a failure (for example a
++// socket Windows already bound implicitly) is logged and not retried.
++void KeepUnboundSocketLocal(uint64_t handle, int af, bool& bound, uint16_t& bound_port,
++                            const char* reason) {
++  if (!REXCVAR_GET(net_loopback_only) || bound || af != AF_INET) {
++    return;
++  }
++  bound = true;
++  sockaddr_in local = {};
++  local.sin_family = AF_INET;
++  local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  local.sin_port = 0;
++  if (bind(handle, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
++    REXLOG_INFO("[net] could not keep an unbound socket on 127.0.0.1 before {}", reason);
++    return;
++  }
++  socklen_t len = sizeof(local);
++  if (getsockname(handle, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
++    bound_port = ntohs(local.sin_port);
++  }
++  REXLOG_INFO("[net] unbound socket kept on 127.0.0.1:{} before {} (net_loopback_only)",
++              bound_port, reason);
++}
++
++}  // namespace
++
+ namespace rex::system {
+ 
+ XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
+@@ -101,6 +138,11 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+ }
+ 
+ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
++  // An outgoing TCP connect never prompts; a "connected" UDP socket still
++  // receives, so it is kept local like any other unbound datagram socket.
++  if (type_ == SOCK_DGRAM) {
++    KeepUnboundSocketLocal(native_handle_, af_, bound_, bound_port_, "connect");
++  }
+   int ret = connect(native_handle_, (sockaddr*)name, name_len);
+   if (ret < 0) {
+     return X_STATUS_UNSUCCESSFUL;
+@@ -110,8 +152,23 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+ }
+ 
+ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
++  // Binding to "any address" (or a LAN address) is what makes Windows Firewall
++  // ask the player for network access the first time the game runs. Nothing a
++  // single-machine session does needs other hosts to reach it, so while
++  // net_loopback_only is on every IPv4 bind is kept on 127.0.0.1.
++  // sin_addr is a big-endian wrapper: it reads and assigns host-order values.
++  if (REXCVAR_GET(net_loopback_only) && name && af_ == AF_INET) {
++    const uint32_t requested = name->sin_addr;
++    if ((requested >> 24) != 127) {
++      name->sin_addr = uint32_t(INADDR_LOOPBACK);
++      REXLOG_INFO("[net] bind {}.{}.{}.{}:{} kept on 127.0.0.1 (net_loopback_only)",
++                  requested >> 24, (requested >> 16) & 0xFF, (requested >> 8) & 0xFF,
++                  requested & 0xFF, uint16_t(name->sin_port));
++    }
++  }
+   int ret = bind(native_handle_, (sockaddr*)name, name_len);
+   if (ret < 0) {
++    REXLOG_INFO("[net] bind to port {} failed", name ? uint16_t(name->sin_port) : 0);
+     return X_STATUS_UNSUCCESSFUL;
+   }
+ 
+@@ -122,6 +179,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+ }
+ 
+ X_STATUS XSocket::Listen(int backlog) {
++  KeepUnboundSocketLocal(native_handle_, af_, bound_, bound_port_, "listen");
+   int ret = listen(native_handle_, backlog);
+   if (ret < 0) {
+     return X_STATUS_UNSUCCESSFUL;
+@@ -186,6 +244,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+   }
+   */
+ 
++  KeepUnboundSocketLocal(native_handle_, af_, bound_, bound_port_, "recvfrom");
+   sockaddr_in nfrom;
+   socklen_t nfromlen = sizeof(sockaddr_in);
+   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+@@ -221,6 +280,7 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+   }
+   */
+ 
++  KeepUnboundSocketLocal(native_handle_, af_, bound_, bound_port_, "sendto");
+   sockaddr_in nto;
+   if (to) {
+     nto.sin_addr.s_addr = to->sin_addr;
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b..536e157 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -461,8 +461,13 @@ bool D3D12Provider::Initialize() {
+       uint32_t(tiled_resources_tier_), unaligned_block_textures_supported_ ? "yes" : "no");
+ 
+   // Get the graphics analysis interface, will silently fail if PIX is not
+-  // attached.
+-  pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&graphics_analysis_));
++  // attached. The function pointer itself is null whenever the DXGI debug
++  // interface couldn't be loaded at all (e.g. no Graphics Tools feature
++  // installed), which is a normal, non-fatal case - guard against it the
++  // same way the destructor above does.
++  if (pfn_dxgi_get_debug_interface1_) {
++    pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&graphics_analysis_));
++  }
+ 
+   return true;
+ }
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index 97b3131..124b627 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -401,6 +401,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   }
+   dialog_loop_next_index_ = SIZE_MAX;
+ 
++  // Snapshot popup state now, on the UI thread where ImGui's context is
++  // valid to query, for HasOpenModalPopup() to hand to other threads safely.
++  has_open_modal_popup_.store(
++      ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel),
++      std::memory_order_relaxed);
++
+   ImGui::Render();
+   ImDrawData* draw_data = ImGui::GetDrawData();
+   if (draw_data) {
+diff --git a/src/ui/overlay/debug_overlay.cpp b/src/ui/overlay/debug_overlay.cpp
+index 8a97c2d..a25b510 100644
+--- a/src/ui/overlay/debug_overlay.cpp
++++ b/src/ui/overlay/debug_overlay.cpp
+@@ -10,6 +10,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ #include <rex/ui/overlay/debug_overlay.h>
++#include <rex/cvar.h>
+ #include <rex/version.h>
+ #include <imgui.h>
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+@@ -17,6 +18,8 @@
+ #include <cinttypes>
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(show_fps, false, "UI/Overlay", "Show FPS counter");
++
+ namespace rex::ui {
+ 
+ DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
+@@ -105,4 +108,47 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
+   ImGui::PopStyleColor();
+ }
+ 
++FpsOverlayDialog::FpsOverlayDialog(ImGuiDrawer* imgui_drawer,
++                                   FrameStatsProvider stats_provider)
++    : ImGuiDialog(imgui_drawer),
++      stats_provider_(std::move(stats_provider)) {}
++
++FpsOverlayDialog::~FpsOverlayDialog() {}
++
++void FpsOverlayDialog::OnDraw(ImGuiIO& io) {
++  if (!REXCVAR_GET(show_fps)) {
++    return;
++  }
++
++  if (!stats_provider_) {
++    return;
++  }
++
++  const auto stats = stats_provider_();
++  if (stats.frame_count == 0 || stats.fps <= 0.0) {
++    return;
++  }
++
++  ImGui::SetNextWindowPos(
++      ImVec2(io.DisplaySize.x - 10.0f, 10.0f),
++      ImGuiCond_Always,
++      ImVec2(1.0f, 0.0f));
++
++  ImGui::SetNextWindowBgAlpha(0.5f);
++
++  if (ImGui::Begin(
++          "##fps_overlay",
++          nullptr,
++          ImGuiWindowFlags_NoDecoration |
++              ImGuiWindowFlags_AlwaysAutoResize |
++              ImGuiWindowFlags_NoSavedSettings |
++              ImGuiWindowFlags_NoFocusOnAppearing |
++              ImGuiWindowFlags_NoNav |
++              ImGuiWindowFlags_NoInputs)) {
++    ImGui::Text("%.1f FPS", stats.fps);
++  }
++
++  ImGui::End();
++}
++
+ }  // namespace rex::ui
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..1126127 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -29,6 +29,10 @@
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
++REXCVAR_DEFINE_INT32(present_frame_limit, 0, "UI/Presenter",
++                     "Host presentation frame limit in FPS (0 = unlimited)")
++    .range(0, 1000);
++
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+ 
+@@ -613,6 +617,34 @@ bool Presenter::RefreshGuestOutput(
+     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
+   }
+ 
++  // PC port host presentation frame limiter.
++  //
++  // This deliberately runs after the newest guest image has been placed in
++  // the mailbox. Frames may therefore be skipped for host presentation without
++  // slowing the Xbox guest timing or GPU vblank logic.
++  int32_t present_frame_limit = REXCVAR_GET(present_frame_limit);
++  if (present_frame_limit > 0) {
++    auto now = std::chrono::steady_clock::now();
++
++    auto minimum_interval =
++        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++            std::chrono::duration<double>(1.0 / double(present_frame_limit)));
++
++    // Allow a small amount of scheduling jitter so a 60 FPS guest capped at
++    // 60 FPS doesn't accidentally drop every second frame.
++    auto jitter_tolerance = minimum_interval / 20;
++
++    if (present_frame_limit_last_present_time_.time_since_epoch().count() != 0 &&
++        now - present_frame_limit_last_present_time_ + jitter_tolerance <
++            minimum_interval) {
++      return true;
++    }
++
++    present_frame_limit_last_present_time_ = now;
++  } else {
++    present_frame_limit_last_present_time_ = {};
++  }
++
+   // Trigger the presentation on the host.
+   PaintResult paint_result = PaintResult::kNotPresented;
+   {
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 25976b4..aee54fc 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -11,10 +11,13 @@
+ 
+ #include <rex/rex_app.h>
+ 
++#include <chrono>
+ #include <cstdlib>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
++#include <rex/graphics/command_processor.h>
++#include <rex/graphics/graphics_system.h>
+ #include <rex/ui/flags.h>
+ #include <rex/kernel/crt/heap.h>
+ #include <rex/filesystem.h>
+@@ -239,6 +242,57 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     return false;
+   }
+ 
++  // Feed the overlays actual guest-present FPS rather than host UI FPS.
++  {
++    auto last_time = std::chrono::steady_clock::now();
++    uint64_t last_frame_count = 0;
++    double last_fps = 0.0;
++
++    SetGuestFrameStats(
++        [this, last_time, last_frame_count, last_fps]() mutable {
++          ui::FrameStats stats;
++
++          if (!runtime_) {
++            return stats;
++          }
++
++          auto* graphics_system = runtime_->graphics_system();
++          if (!graphics_system) {
++            return stats;
++          }
++
++          const uint64_t frame_count =
++              graphics_system->guest_frame_count();
++          const auto now = std::chrono::steady_clock::now();
++
++          if (last_frame_count == 0) {
++            last_frame_count = frame_count;
++            last_time = now;
++          }
++
++          const double elapsed_seconds =
++              std::chrono::duration<double>(now - last_time).count();
++
++          if (elapsed_seconds >= 0.25) {
++            const uint64_t frame_delta =
++                frame_count - last_frame_count;
++
++            last_fps =
++                static_cast<double>(frame_delta) / elapsed_seconds;
++
++            last_frame_count = frame_count;
++            last_time = now;
++          }
++
++          stats.frame_count = frame_count;
++          stats.fps = last_fps;
++          stats.frame_time_ms =
++              last_fps > 0.0 ? 1000.0 / last_fps : 0.0;
++
++          return stats;
++        });
++  }
++
+   if (window_ && runtime_->input_system()) {
+     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
+   }
+@@ -251,6 +305,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+     if (input_sys) {
+       input_sys->SetActiveCallback([this]() {
++        // A modal ImGui popup (BeginPopupModal) is exclusive by definition -
++        // block guest input unconditionally while one is open, regardless of
++        // mouse position. This covers app-added dialogs the base ReXApp has
++        // no member flag for (e.g. a title's own settings dialog), not just
++        // the four named overlays below. Queried via a plain atomic snapshot
++        // (not live ImGui state) because this callback runs on whichever
++        // guest thread calls XamInputGetState, concurrently with the UI
++        // thread's own ImGui frame - ImGui's context isn't thread-safe.
++        if (imgui_drawer_->HasOpenModalPopup()) {
++          return false;
++        }
+         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+           return true;
+         return !imgui_drawer_->GetIO().WantCaptureMouse;
+@@ -304,6 +369,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   return true;
+ }
+ 
++std::string ReXApp::GetWindowTitle() const {
++  return std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
++}
+ bool ReXApp::SetupPresentation() {
+   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
+   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+@@ -339,9 +407,7 @@ bool ReXApp::SetupPresentation() {
+     return false;
+   }
+ 
+-  // Set window title with SDK build stamp
+-  std::string title = std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
+-  window_->SetTitle(title);
++  window_->SetTitle(GetWindowTitle());
+ 
+   window_->AddListener(this);
+   window_->AddInputListener(this, 0);
+@@ -385,6 +451,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
+   // lazily on the first Draw instead).
+   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
++
++  fps_overlay_ =
++      std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
++
+   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
+     if (debug_overlay_) {
+       debug_overlay_.reset();
+@@ -599,9 +669,14 @@ void ReXApp::OnDestroy() {
+ 
+ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
+   frame_stats_provider_ = provider;
++
+   if (debug_overlay_) {
+     debug_overlay_->SetStatsProvider(provider);
+   }
++
++  if (fps_overlay_) {
++    fps_overlay_->SetStatsProvider(provider);
++  }
+ }
+ 
+ }  // namespace rex
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index c37e550..ab57949 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -221,6 +221,81 @@ void* WindowSDL::GetNativeWindowHandle() const {
+ #endif
+ }
+ 
++void WindowSDL::SetRelativeMouseMode(bool enabled) {
++  if (!sdl_window_) {
++    return;
++  }
++  SDL_SetWindowRelativeMouseMode(sdl_window_, enabled);
++}
++
++void WindowSDL::SetLogicalSize(uint32_t logical_width,
++                               uint32_t logical_height) {
++  if (!sdl_window_ || logical_width == 0 || logical_height == 0) {
++    return;
++  }
++
++  // Keep the requested game resolution unchanged.
++  OnDesiredLogicalSizeUpdate(logical_width, logical_height);
++
++  int window_width = int(SizeToPhysical(logical_width));
++  int window_height = int(SizeToPhysical(logical_height));
++
++  // Fullscreen uses the normal selected resolution path.
++  if (IsFullscreen()) {
++    SDL_SetWindowSize(sdl_window_, window_width, window_height);
++    return;
++  }
++
++  // Windowed mode must fit inside the usable desktop including decorations.
++  SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
++  if (!display) {
++    display = SDL_GetPrimaryDisplay();
++  }
++
++  SDL_Rect usable{};
++  if (display && SDL_GetDisplayUsableBounds(display, &usable)) {
++    int border_top = 0;
++    int border_left = 0;
++    int border_bottom = 0;
++    int border_right = 0;
++
++    SDL_GetWindowBordersSize(
++        sdl_window_,
++        &border_top,
++        &border_left,
++        &border_bottom,
++        &border_right);
++
++    int max_width =
++        usable.w - border_left - border_right;
++    int max_height =
++        usable.h - border_top - border_bottom;
++
++    if (max_width > 0 && max_height > 0 &&
++        (window_width > max_width || window_height > max_height)) {
++      double fit_scale = std::min(
++          double(max_width) / double(window_width),
++          double(max_height) / double(window_height));
++
++      window_width =
++          std::max(1, int(double(window_width) * fit_scale));
++      window_height =
++          std::max(1, int(double(window_height) * fit_scale));
++    }
++  }
++
++  SDL_SetWindowSize(sdl_window_, window_width, window_height);
++  SDL_SyncWindow(sdl_window_);
++
++  // Always center windowed mode on the display containing the window.
++  if (display) {
++    SDL_SetWindowPosition(
++        sdl_window_,
++        SDL_WINDOWPOS_CENTERED_DISPLAY(display),
++        SDL_WINDOWPOS_CENTERED_DISPLAY(display));
++    SDL_SyncWindow(sdl_window_);
++  }
++}
+ uint32_t WindowSDL::GetLatestDpiImpl() const {
+   float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
+                             : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+@@ -234,7 +309,17 @@ void WindowSDL::ApplyNewFullscreen() {
+   if (!sdl_window_) {
+     return;
+   }
++
+   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
++  SDL_SyncWindow(sdl_window_);
++
++  // When returning to windowed mode, refit and recenter the requested
++  // resolution so the title bar can never be restored off-screen.
++  if (!IsFullscreen()) {
++    SetLogicalSize(
++        GetDesiredLogicalWidth(),
++        GetDesiredLogicalHeight());
++  }
+ }
+ 
+ void WindowSDL::ApplyNewTitle() {
+@@ -458,7 +543,8 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
+         RearmCursorAutoHideTimer();
+       }
+       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
+-                   int32_t(event.motion.y * density));
++                   int32_t(event.motion.y * density), 0, 0,
++                   int32_t(event.motion.xrel * density), int32_t(event.motion.yrel * density));
+       OnMouseMove(e, destruction_receiver);
+       break;
+     }

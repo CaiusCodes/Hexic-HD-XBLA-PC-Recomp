@@ -1,0 +1,10 @@
+# Portable release defaults. Settings and saves remain beside the game.
+license_mask = 1
+fullscreen = false
+vsync = true
+video_mode_width = 1280
+video_mode_height = 720
+resolution_scale = 1
+show_fps = false
+readback_resolve = "fast"
+gpu_plugin = "xenos"

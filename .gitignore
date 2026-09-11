@@ -1,0 +1,21 @@
+# Build output: CMake build trees, release staging and ZIPs.
+/out/
+
+# Built by packaging/Build-Stubs.ps1 and Make-Icon.ps1 during a release.
+/packaging/Install Hexic HD.exe
+/packaging/Hexic HD.exe
+/packaging/hexic_hd.ico
+
+# Game data from an Xbox 360 package must never be committed.
+*.xex
+assets/
+userdata/
+*.bin
+*.log
+
+# Editors and OS files.
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
