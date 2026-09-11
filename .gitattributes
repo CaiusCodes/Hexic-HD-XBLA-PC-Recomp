@@ -1,0 +1,3 @@
+# Keep the SDK patch byte-identical on every checkout, so `git apply` matches
+# the ReXGlue sources whatever the builder's line-ending settings are.
+*.patch text eol=lf
