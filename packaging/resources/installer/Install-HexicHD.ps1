@@ -11,7 +11,7 @@
 
       -PackagePath <file>   preselect a package (the window still opens)
       -Unattended           install -PackagePath without a window; exit code 0/1
-      -Extras a,b           with -Unattended: extras to switch on (mnk, fullscreen, shortcut)
+      -Extras a,b           with -Unattended: extras to switch on (fullscreen, shortcut)
       -ShortcutFolder <dir> testing: put the desktop shortcut here instead
 #>
 [CmdletBinding()]
@@ -367,8 +367,6 @@ function Start-Game {
 $configPath = Join-Path $gameDir 'hexic_hd.toml'
 $shortcutName = 'Hexic HD.lnk'
 $extraDefinitions = @(
-    @{ Id = 'mnk'; Title = 'Keyboard controls'; Short = 'Keyboard'
-        Detail = 'Play without a controller: arrows move, Space and Shift act as A and B.'; Setting = 'mnk_mode' },
     @{ Id = 'fullscreen'; Title = 'Start in fullscreen'; Short = 'Fullscreen'
         Detail = 'Switch at any time from PC Settings on the main menu.'; Setting = 'fullscreen' },
     @{ Id = 'shortcut'; Title = 'Desktop shortcut'; Short = 'Desktop shortcut'

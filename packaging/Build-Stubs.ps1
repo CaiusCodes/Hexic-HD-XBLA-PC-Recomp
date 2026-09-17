@@ -3,7 +3,7 @@
 #   Hexic HD.exe           play    (launcher_stub.cpp)
 # Static CRT, so neither needs the Visual C++ runtime to start.
 [CmdletBinding()]
-param([string]$Version = '1.0.0')
+param([string]$Version = '1.1.0')
 
 $ErrorActionPreference = 'Stop'
 $packaging = $PSScriptRoot

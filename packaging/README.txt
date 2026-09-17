@@ -30,7 +30,7 @@ because Setup is not signed with a paid certificate. Choose "More info", then
 
 WHERE THINGS LIVE
   Game\                      the installed game
-  Game\userdata\             saves, profile and your leaderboard scores
+  Game\userdata\             saves, profile and your high scores
   Game\hexic_hd.toml         settings
   Game\logs\                 game logs
   logs\                      Setup logs
@@ -40,32 +40,48 @@ whole folder. Running Setup again updates the game files and keeps your saves
 (userdata) and your settings (hexic_hd.toml). Saves from an earlier portable
 build of this port are carried over when this release is extracted over it.
 
-PC SETTINGS AND LEADERBOARDS
-  The main menu's Achievements entry is now PC Settings: Windowed/Fullscreen,
-  Resolution (up to 3840 x 2160), Vsync and Show FPS. Changes apply
-  immediately. Xbox Dashboard is now Quit Hexic.
+PC SETTINGS
+  The main menu's Achievements entry is now PC Settings:
+    Player Name          the name shown on High Scores and the new-high-score
+                         screen (up to 15 characters; leave it empty to use
+                         your Windows user name)
+    Display Mode         Windowed or Fullscreen
+    Resolution           1280 x 720 up to 3840 x 2160
+    VSync, Show FPS
+    Keyboard Controls    change the keys (see CONTROLS)
+  Changes apply immediately. Xbox Dashboard is now Quit Hexic.
 
-  Leaderboards works offline with your own scores. Whenever a Marathon, Timed
-  or Survival game beats your best for that mode, the game records it - the
-  score, the difficulty and the gem counts - and its own Leaderboards screen
-  lists it on that mode's tab. Sort Mode (X) switches between Friends (your
-  best score), My Score and Overall. Scores are kept in
-  Game\userdata\leaderboards.
+HIGH SCORES
+  Leaderboards is now High Scores, and it works offline. Whenever a Marathon,
+  Timed or Survival game beats your best for that mode, the game records it -
+  the score, the difficulty, the gem counts and your player name - and High
+  Scores lists it on that mode's tab. Scores are kept in
+  Game\userdata\leaderboards. Changing your player name does not rename scores
+  already recorded.
 
 CONTROLS
-  An Xbox controller works out of the box. To play on the keyboard, tick
-  "Keyboard controls" in Setup's extras (or set mnk_mode = true in
-  Game\hexic_hd.toml). The keys stand in for controller buttons:
-    D-pad                 Arrow keys
-    Left stick            W A S D
-    A / B / X / Y         Space / Shift / R / E
-    Shoulder buttons      Q / F
-    Triggers              Right / left mouse button
-    Start (pause)         Esc
-    Back                  Tab
-  In the PC Settings panel use the arrow keys, Enter and Esc.
-  To change a key, edit the keybind_ lines in Game\hexic_hd.toml while the
-  game is closed.
+  Keyboard and an Xbox controller both work, at the same time. Each key stands
+  in for a controller input. The defaults:
+    Move                        Arrow keys (D-pad) or W A S D (left stick)
+    Rotate clockwise, select    Space or Enter (A)
+    Rotate counter-clockwise    Q (X)
+    Rotate with the triggers    Z (left trigger) / X (right trigger)
+    Back                        Backspace (B)
+    Pause                       Esc (Start)
+    Y, bumpers, Back button     E, 1 / 3, Tab
+    Right stick                 I J K L, stick clicks C / V
+
+  To change them, open PC Settings > Keyboard Controls. Every controller
+  input is listed with its keys:
+    Enter / A          change the key (then press the new key; Esc cancels)
+    Tab / Y            add a second key
+    Backspace / X      reset that input to its default
+  Reset All to Defaults restores every key. Giving an input a key that
+  another input uses swaps them, so nothing is left without a key. Mouse
+  buttons can be bound too.
+
+  The PC Settings panels use the arrow keys, Enter and Esc, or the D-pad, A
+  and B.
 
 REQUIREMENTS
   Windows 10 or 11 (64-bit) and a DirectX 12 graphics card. No separate
@@ -73,7 +89,8 @@ REQUIREMENTS
 
 KNOWN LIMITATIONS
   - Xbox LIVE features (online leaderboards, the achievements viewer) are not
-    available; Leaderboards shows this PC's scores instead (see above).
+    available; High Scores shows this PC's scores instead (see above).
+  - The player name can only be typed on a keyboard.
 
 TROUBLESHOOTING
   - "Hexic HD.exe" says the game is not installed: run Setup first.

@@ -11,10 +11,13 @@ package (title ID `584107D1`). Setup installs the game from it.
 - Portable install: one Setup program extracts your package into a `Game` folder
   beside it, and everything (saves, settings, scores) stays in that folder.
 - **PC Settings** in the main menu (in place of the Xbox-only Achievements viewer):
-  windowed/fullscreen, resolution up to 3840 x 2160, VSync and an FPS counter.
+  player name, windowed/fullscreen, resolution up to 3840 x 2160, VSync, an FPS
+  counter and keyboard controls.
 - **High Scores** that work offline: the game's own Leaderboards screen, renamed,
-  shows your best Marathon, Timed and Survival scores from this PC.
-- Xbox controller support, plus optional keyboard controls.
+  shows your best Marathon, Timed and Survival scores from this PC under your
+  player name.
+- **Keyboard and controller** at the same time. Every controller input has a
+  keyboard default and can be remapped in PC Settings > Keyboard Controls.
 - "Quit Hexic" returns to the desktop.
 
 ## Install and play

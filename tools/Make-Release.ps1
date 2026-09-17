@@ -14,7 +14,7 @@
 [CmdletBinding()]
 param(
     [string]$BuildPreset = "win-amd64-release",
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.1.0",
     # Folder holding the Visual C++ runtime DLLs to ship; found automatically.
     [string]$VcRedistDir,
     # Extracted game data to compare the release against byte for byte.
