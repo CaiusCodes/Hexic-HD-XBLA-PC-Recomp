@@ -52,6 +52,17 @@ scores, keyboard input, the player name, and window and settings hooks. They are
 `sdk/rexglue-sdk-v0.9.0.patch` (44 files, applies to a clean v0.9.0) and contain no
 networking code.
 
+**The easy way.** One command clones ReXGlue at v0.9.0, fixes libmspack (see below),
+applies the patch, then builds and installs the SDK into `..\rexglue-sdk`, where the
+game's CMake presets look for it. It never replaces anything that already exists:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\Get-Sdk.ps1
+```
+
+(`-Destination <folder>` puts the SDK somewhere else; `-SkipBuild` stops after the
+patch.) Or do the same by hand:
+
 ```bat
 git clone https://github.com/rexglue/rexglue-sdk.git
 cd rexglue-sdk
@@ -87,9 +98,14 @@ cmake --install out/build/win-amd64 --config Release --prefix C:\rexglue-sdk-ins
 
 ```bat
 cd path\to\hexic-hd-pc
-cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH=C:\rexglue-sdk-install
+cmake --preset win-amd64-release
 cmake --build out/build/win-amd64-release --target hexic_hd
 ```
+
+The presets look for the SDK in `..\rexglue-sdk\out\install\win-amd64`, which is
+where `tools\Get-Sdk.ps1` puts it, and will not fall back to any other install. If you
+built the SDK by hand and installed it elsewhere, add
+`-DCMAKE_PREFIX_PATH=C:\rexglue-sdk-install` (your install folder) to the first command.
 
 ### 3. Package a release
 
@@ -114,7 +130,7 @@ rexglue codegen hexic_hd_manifest.toml
 | `src/` | The PC app: paths, fonts, PC Settings panel, Xbox LIVE sign-in shim |
 | `generated/` | Recompiled game code (ReXGlue codegen output) |
 | `packaging/` | Setup, play launcher, installer scripts, player README, licenses |
-| `tools/` | Release builder and STFS extractor |
+| `tools/` | SDK setup script (`Get-Sdk.ps1`), release builder and STFS extractor |
 | `sdk/` | Patch for ReXGlue v0.9.0 |
 
 ## Legal
