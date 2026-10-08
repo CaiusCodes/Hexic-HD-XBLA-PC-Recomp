@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Clones https://github.com/rexglue/rexglue-sdk at the pinned v0.9.0 commit,
-  fetches its submodules, makes libmspack's source files real files (see below),
-  applies sdk\rexglue-sdk-v0.9.0.patch, then builds and installs the SDK into
+  fetches its submodules, applies sdk\rexglue-sdk-v0.9.0.patch, then builds and
+  installs the SDK into
   <Destination>\out\install\win-amd64. The game's CMake presets look for it there
   (..\rexglue-sdk next to this project), so afterwards:
 
@@ -15,11 +15,10 @@
   Nothing that already exists is ever replaced: Destination must not exist yet, or
   must be an empty folder.
 
-  libmspack keeps some of its source files as symlinks. Where git is not allowed to
-  create symlinks (core.symlinks=false, the default on many Windows setups) they are
-  checked out as tiny text files and the SDK will not compile, so this script copies
-  the real files over them. Do not run "git checkout" or "git clean" inside
-  thirdparty\libmspack afterwards: that puts the stubs back.
+  libmspack keeps some of its files as symlinks, which git checks out as tiny text
+  files where symlinks are off (the default on many Windows setups). The patch makes
+  the SDK build libmspack from its real sources instead, so this works whatever the
+  machine's git symlink setting is.
 
 .PARAMETER Destination
   Where to put the SDK. Default: rexglue-sdk, next to this project's folder.
@@ -97,30 +96,22 @@ Write-Host "At $Tag ($($Pin.Substring(0, 7)))"
 Step 'Fetching submodules (large: this takes a few minutes)'
 Invoke-Git -C $Destination submodule update --init --recursive
 
-# --- 4. libmspack symlink stubs -------------------------------------------------------
+# --- 4. libmspack ---------------------------------------------------------------------
 Step 'Checking libmspack'
-$mspack = Join-Path $Destination 'thirdparty\libmspack\cabextract\mspack'
-if (-not (Test-Path -LiteralPath $mspack)) { throw "libmspack was not fetched: $mspack" }
-$fixed = 0
-Get-ChildItem -LiteralPath $mspack -File | Where-Object Length -lt 100 | ForEach-Object {
-    $target = Join-Path $_.DirectoryName (Get-Content -LiteralPath $_.FullName -Raw).Trim()
-    if (Test-Path -LiteralPath $target -PathType Leaf) {
-        Copy-Item -LiteralPath $target -Destination $_.FullName -Force
-        $fixed++
-    }
-}
-$left = @(Get-ChildItem -LiteralPath $mspack -File | Where-Object Length -lt 100).Count
-if ($left -gt 0) { throw "$left libmspack file(s) are still symlink stubs; the SDK would not compile." }
-Write-Host "libmspack: $fixed symlink stub(s) replaced with the real files"
+# The patch points the build at libmspack's real sources (libmspack\mspack), so the
+# symlink stubs git leaves in cabextract\mspack where symlinks are off do not matter.
+$lzxd = Join-Path $Destination 'thirdparty\libmspack\libmspack\mspack\lzxd.c'
+if (-not (Test-Path -LiteralPath $lzxd -PathType Leaf)) { throw "libmspack was not fetched: $lzxd" }
+Write-Host 'libmspack: real sources present'
 
 # --- 5. The patch ---------------------------------------------------------------------
 Step 'Applying the Hexic HD SDK patch'
 Invoke-Git -C $Destination apply --check $patch
 Invoke-Git -C $Destination apply $patch
 # Commit it on a branch, so the SDK folder is a normal repository and the patch can be
-# regenerated with: git diff v0.9.0 hexic-minimal -- src include
+# regenerated with: git diff v0.9.0 hexic-minimal -- src include thirdparty/CMakeLists.txt
 Invoke-Git -C $Destination switch -c hexic-minimal
-Invoke-Git -C $Destination add -- src include
+Invoke-Git -C $Destination add -- src include thirdparty/CMakeLists.txt
 Invoke-Git -C $Destination -c user.name='Hexic HD PC contributors' -c user.email='' commit -q -m 'Hexic HD SDK changes (sdk/rexglue-sdk-v0.9.0.patch applied to v0.9.0)'
 $changed = @(& git -C $Destination diff --name-only $Tag HEAD).Count
 Write-Host "Patch applied: $changed files changed on branch hexic-minimal"

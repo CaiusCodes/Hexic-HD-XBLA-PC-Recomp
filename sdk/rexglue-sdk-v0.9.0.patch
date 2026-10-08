@@ -3882,3 +3882,20 @@ index c37e550..ab57949 100644
        OnMouseMove(e, destruction_receiver);
        break;
      }
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 3cc4e22..2d445e6 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -112,8 +112,10 @@ target_include_directories(aes128 PUBLIC
+ target_compile_options(aes128 PRIVATE -w)
+ 
+ # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
+-# Uses cabextract version which has all needed headers in one place
+-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
++# libmspack's cabextract/mspack entries are symbolic links to libmspack/mspack;
++# Git for Windows checks them out as text files unless symlinks are enabled.
++# Build from the real sources so a default Windows clone compiles.
++set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
+ add_library(mspack STATIC
+     ${MSPACK_DIR}/lzxd.c
+ )
