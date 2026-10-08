@@ -47,8 +47,10 @@ Requirements: Windows 10 or 11 (64-bit) and a DirectX 12 graphics card.
 
 ### 1. Build the ReXGlue SDK with this port's changes
 
-The port needs changes to ReXGlue v0.9.0 that are not upstream (local leaderboards,
-input, window and settings hooks). They are in `sdk/rexglue-sdk-v0.9.0.patch`.
+The port needs changes to ReXGlue v0.9.0 that are not upstream: the offline high
+scores, keyboard input, the player name, and window and settings hooks. They are in
+`sdk/rexglue-sdk-v0.9.0.patch` (44 files, applies to a clean v0.9.0) and contain no
+networking code.
 
 ```bat
 git clone https://github.com/rexglue/rexglue-sdk.git
@@ -56,6 +58,26 @@ cd rexglue-sdk
 git checkout v0.9.0
 git submodule update --init --recursive
 git apply path\to\hexic-hd-pc\sdk\rexglue-sdk-v0.9.0.patch
+```
+
+**Windows without symlink support.** libmspack stores some of its source files as
+symlinks. If git's `core.symlinks` is `false` (the default on many Windows setups),
+they are checked out as tiny text files and the SDK will not compile. Replace them
+with the real files before building (run from the `rexglue-sdk` folder):
+
+```powershell
+Get-ChildItem thirdparty\libmspack\cabextract\mspack -File | Where-Object Length -lt 100 |
+    ForEach-Object {
+        $target = Join-Path $_.DirectoryName (Get-Content -LiteralPath $_.FullName -Raw).Trim()
+        if (Test-Path -LiteralPath $target -PathType Leaf) { Copy-Item -LiteralPath $target -Destination $_.FullName -Force }
+    }
+```
+
+Do not run `git checkout` or `git clean` inside `thirdparty/libmspack` afterwards: that
+puts the stubs back. (With Developer Mode on and `git config --global core.symlinks
+true` before cloning, none of this is needed.)
+
+```bat
 cmake --preset win-amd64
 cmake --build out/build/win-amd64 --config Release
 cmake --install out/build/win-amd64 --config Release --prefix C:\rexglue-sdk-install
