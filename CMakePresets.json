@@ -51,15 +51,24 @@
             }
         },
         {
+            "name": "local-sdk",
+            "hidden": true,
+            "description": "Build against this project's own ReXGlue SDK install (../rexglue-sdk), and never fall back to CMake's user package registry, which still lists SDK installs from the old shared layout.",
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../rexglue-sdk/out/install/win-amd64",
+                "CMAKE_FIND_USE_PACKAGE_REGISTRY": { "type": "BOOL", "value": "OFF" }
+            }
+        },
+        {
             "name": "win-amd64-debug",
             "displayName": "Windows AMD64 Debug",
-            "inherits": "windows-base",
+            "inherits": [ "local-sdk", "windows-base" ],
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
         },
         {
             "name": "win-amd64-release",
             "displayName": "Windows AMD64 Release",
-            "inherits": "windows-base",
+            "inherits": [ "local-sdk", "windows-base" ],
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
         },
         {
@@ -77,7 +86,7 @@
         {
             "name": "win-amd64-relwithdebinfo",
             "displayName": "Windows AMD64 RelWithDebInfo",
-            "inherits": "windows-base",
+            "inherits": [ "local-sdk", "windows-base" ],
             "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
         },
         {

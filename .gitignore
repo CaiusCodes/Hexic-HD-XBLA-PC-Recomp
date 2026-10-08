@@ -1,6 +1,12 @@
 # Build output: CMake build trees, release staging and ZIPs.
 /out/
 
+# Per-machine preset overrides. CMakePresets.json already pins this project's
+# own SDK install (the hidden "local-sdk" preset), so this file is optional: it
+# adds a "local" preset that keeps the pin even if CMakePresets.json is ever
+# regenerated from the ReXGlue template. Its content is quoted in CLAUDE.md.
+/CMakeUserPresets.json
+
 # Built by packaging/Build-Stubs.ps1 and Make-Icon.ps1 during a release.
 /packaging/Install Hexic HD.exe
 /packaging/Hexic HD.exe
