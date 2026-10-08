@@ -58,8 +58,8 @@ $Destination = [IO.Path]::GetFullPath($Destination)
 
 function Step([string]$Text) { Write-Host ''; Write-Host "== $Text" -ForegroundColor Cyan }
 
-function Git {
-    & git @args
+function Invoke-Git {
+    & git.exe @args
     if ($LASTEXITCODE -ne 0) { throw ("git " + ($args -join ' ') + " failed (exit $LASTEXITCODE)") }
 }
 
@@ -85,17 +85,17 @@ Write-Host "Cloning:     $Source"
 Step "Cloning ReXGlue at $Tag"
 # core.autocrlf=false so the patch's line endings match the files exactly, whatever the
 # machine's own setting; core.longpaths because some submodules have deep trees.
-Git -c core.autocrlf=false -c core.longpaths=true clone --no-checkout $Source $Destination
-Git -C $Destination config core.autocrlf false
-Git -C $Destination config core.longpaths true
-Git -C $Destination checkout --detach $Pin
+Invoke-Git -c core.autocrlf=false -c core.longpaths=true clone --no-checkout $Source $Destination
+Invoke-Git -C $Destination config core.autocrlf false
+Invoke-Git -C $Destination config core.longpaths true
+Invoke-Git -C $Destination checkout --detach $Pin
 $head = (& git -C $Destination rev-parse HEAD).Trim()
 if ($head -ne $Pin) { throw "Checked out $head, expected $Pin ($Tag)." }
 Write-Host "At $Tag ($($Pin.Substring(0, 7)))"
 
 # --- 3. Submodules -------------------------------------------------------------------
 Step 'Fetching submodules (large: this takes a few minutes)'
-Git -C $Destination submodule update --init --recursive
+Invoke-Git -C $Destination submodule update --init --recursive
 
 # --- 4. libmspack symlink stubs -------------------------------------------------------
 Step 'Checking libmspack'
@@ -115,13 +115,13 @@ Write-Host "libmspack: $fixed symlink stub(s) replaced with the real files"
 
 # --- 5. The patch ---------------------------------------------------------------------
 Step 'Applying the Hexic HD SDK patch'
-Git -C $Destination apply --check $patch
-Git -C $Destination apply $patch
+Invoke-Git -C $Destination apply --check $patch
+Invoke-Git -C $Destination apply $patch
 # Commit it on a branch, so the SDK folder is a normal repository and the patch can be
 # regenerated with: git diff v0.9.0 hexic-minimal -- src include
-Git -C $Destination switch -c hexic-minimal
-Git -C $Destination add -- src include
-Git -C $Destination -c user.name='Hexic HD PC contributors' -c user.email='' commit -q -m 'Hexic HD SDK changes (sdk/rexglue-sdk-v0.9.0.patch applied to v0.9.0)'
+Invoke-Git -C $Destination switch -c hexic-minimal
+Invoke-Git -C $Destination add -- src include
+Invoke-Git -C $Destination -c user.name='Hexic HD PC contributors' -c user.email='' commit -q -m 'Hexic HD SDK changes (sdk/rexglue-sdk-v0.9.0.patch applied to v0.9.0)'
 $changed = @(& git -C $Destination diff --name-only $Tag HEAD).Count
 Write-Host "Patch applied: $changed files changed on branch hexic-minimal"
 
