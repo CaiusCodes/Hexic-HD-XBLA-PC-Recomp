@@ -38,10 +38,37 @@
 #include <rex/ui/window.h>
 #include <rex/ui/window_sdl.h>
 
+#include "hexic_system_info.h"
+
 // Which set of Hexic keyboard defaults this config has received (main.cpp).
 REXCVAR_DECLARE(int32_t, hexic_controls_version);
 
 class HexicHdApp;
+
+// Where the game keeps its data. In a release the game program lives in
+// <release>\resources\runtime and its data beside that folder (resources\assets,
+// resources\userdata with hexic_hd.toml); the launcher in the release root starts
+// it. Dev builds, and the earlier portable builds (Game\hexic_hd.exe), keep
+// everything beside the exe (assets, userdata, hexic_hd.toml).
+namespace hexic_paths {
+inline std::filesystem::path ExeFolder() {
+  wchar_t exe_path[32768] = {};
+  const DWORD length = GetModuleFileNameW(nullptr, exe_path, 32768);
+  return std::filesystem::path(std::wstring(exe_path, length)).parent_path();
+}
+inline bool InRuntimeFolder() {
+  std::wstring name = ExeFolder().filename().wstring();
+  for (wchar_t& c : name) c = static_cast<wchar_t>(towlower(c));
+  return name == L"runtime";
+}
+inline std::filesystem::path DataRoot() {
+  const auto exe = ExeFolder();
+  return InRuntimeFolder() ? exe.parent_path() : exe;
+}
+inline std::filesystem::path ConfigPath() {
+  return InRuntimeFolder() ? DataRoot() / "userdata" / "hexic_hd.toml" : ExeFolder() / "hexic_hd.toml";
+}
+}  // namespace hexic_paths
 
 // Fonts loaded from the game's own asset files (see HexicHdApp::
 // OnConfigureFonts), so the panel reads with the game's actual typography
@@ -362,6 +389,7 @@ class HexicSettingsDialog : public rex::ui::ImGuiDialog {
     kRowPlayerName = 0,
     kRowFullscreen,
     kRowResolution,
+    kRowRenderScale,
     kRowVSync,
     kRowShowFps,
     kRowControls,
@@ -470,7 +498,7 @@ class HexicMenuInput {
   std::chrono::steady_clock::time_point repeat_at_[kCount] = {};
 };
 
-// PC Settings > Player Name: the name Hexic shows as your gamertag (High
+// Settings > Player Name: the name Hexic shows as your gamertag (High
 // Scores, the new-high-score screen). Typed characters come from ImGui's
 // input queue; empty means the Windows user name, as before.
 class HexicNameEntryDialog : public rex::ui::ImGuiDialog {
@@ -492,7 +520,7 @@ class HexicNameEntryDialog : public rex::ui::ImGuiDialog {
   std::chrono::steady_clock::time_point opened_at_{};
 };
 
-// PC Settings > Keyboard Controls: every controller input with the keys bound
+// Settings > Keyboard Controls: every controller input with the keys bound
 // to it. Enter changes a key, Tab adds a second one, Backspace resets that
 // input, plus Reset All and Done rows at the end.
 class HexicControlsDialog : public rex::ui::ImGuiDialog {
@@ -557,34 +585,37 @@ class HexicHdApp : public rex::ReXApp {
     return app;
   }
 
-  // Keep the game fully portable: assets, saves and cache all live beside
-  // the executable rather than under the user's profile, so the installed
-  // folder can be moved or backed up as a single unit. Installation itself
-  // (STFS extraction into assets\) is handled by the external graphical
-  // installer, not by this app.
+  // Keep the game fully portable: assets, saves and cache all live in the
+  // release folder rather than under the user's profile, so it can be moved or
+  // backed up as a single unit (see hexic_paths). Importing the game data (STFS
+  // extraction into assets\) is handled by the launcher in the release root, not
+  // by this app.
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    const auto app_directory = std::filesystem::path(exe_path).parent_path();
+    const auto data_root = hexic_paths::DataRoot();
 
-    const auto assets_path = app_directory / "assets";
+    const auto assets_path = data_root / "assets";
     if (!std::filesystem::is_directory(assets_path)) {
       // Preempt the SDK's generic "--game_data_root does not exist" message
       // (written for a CLI flag the player never typed) with one that tells
       // them what to actually do.
       MessageBoxW(nullptr,
-                  L"No Hexic HD game files found.\n\n"
-                  L"Open \"Install Hexic HD.exe\" (beside the Game folder) "
-                  L"and select your Xbox 360 Hexic HD package, then play again.",
+                  hexic_paths::InRuntimeFolder()
+                      ? L"Hexic HD's game data has not been imported yet.\n\n"
+                        L"Open \"Hexic HD.exe\" in the main Hexic HD folder and select "
+                        L"your Xbox 360 Hexic HD package."
+                      : L"No Hexic HD game files found.\n\n"
+                        L"Open \"Install Hexic HD.exe\" (beside the Game folder) "
+                        L"and select your Xbox 360 Hexic HD package, then play again.",
                   L"Hexic HD", MB_OK | MB_ICONERROR);
       ExitProcess(1);
     }
 
     paths.game_data_root = assets_path;
 
-    const auto user_data_path = app_directory / "userdata";
+    const auto user_data_path = data_root / "userdata";
     paths.user_data_root = user_data_path;
     paths.cache_root = user_data_path / "cache";
+    paths.config_path = hexic_paths::ConfigPath();
   }
 
   std::string GetWindowTitle() const override { return "Hexic HD PC"; }
@@ -601,10 +632,7 @@ class HexicHdApp : public rex::ReXApp {
   // font atlas is built, so this is the supported place to add fonts (no
   // runtime atlas/texture rebuild required).
   void OnConfigureFonts(ImFontAtlas* atlas) override {
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    const auto app_directory = std::filesystem::path(exe_path).parent_path();
-    const auto font_path = app_directory / "assets" / "convectionui.ttf";
+    const auto font_path = hexic_paths::DataRoot() / "assets" / "convectionui.ttf";
     if (!std::filesystem::exists(font_path)) {
       return;
     }
@@ -654,6 +682,11 @@ class HexicHdApp : public rex::ReXApp {
   // defaults are applied once per config; after that the player's own
   // bindings are kept.
   void OnPostSetup() override {
+    // The game always runs at 60 fps. Parts of Hexic move once per frame, so
+    // with V-Sync off the 1000 Hz guest vblank (~220 fps) sped them up; with
+    // a fixed vblank V-Sync only decides whether frames may tear.
+    rex::cvar::SetFlagByName("fixed_guest_vblank", "true");
+    hexic_system_info::Log();
     rex::cvar::SetFlagByName("mnk_mode", "true");
     rex::cvar::SetFlagByName("mnk_mouse", "false");
     rex::cvar::SetFlagByName("mnk_dpad_to_stick", "false");
@@ -785,7 +818,8 @@ class HexicHdApp : public rex::ReXApp {
     rex::cvar::SaveConfig(app->config_path());
   }
 
-  static void SetPcResolution(int32_t width, int32_t height, int32_t scale) {
+  // Resolution is the output (window) size only; Render Scale is separate.
+  static void SetPcResolution(int32_t width, int32_t height) {
     HexicHdApp* app = current_instance_;
     if (!app) {
       return;
@@ -794,16 +828,9 @@ class HexicHdApp : public rex::ReXApp {
     bool changed = false;
     changed |= rex::cvar::SetFlagByName("video_mode_width", std::to_string(width));
     changed |= rex::cvar::SetFlagByName("video_mode_height", std::to_string(height));
-    bool scale_changed = rex::cvar::SetFlagByName("resolution_scale", std::to_string(scale));
-    changed |= scale_changed;
 
     if (changed) {
       SavePcSettings();
-    }
-
-    // Rebuild scale-dependent graphics resources immediately.
-    if (scale_changed && app->runtime() && app->runtime()->graphics_system()) {
-      app->runtime()->graphics_system()->ReinitializeContext();
     }
 
     // Apply the output/window resolution immediately.
@@ -813,6 +840,29 @@ class HexicHdApp : public rex::ReXApp {
         sdl_window->SetLogicalSize(width, height);
       }
     });
+  }
+
+  // Render Scale: how many times the game's own 1280 x 720 picture is
+  // rendered in each direction (1x, 2x or 3x), independent of the output
+  // resolution. More is sharper and costs the graphics card more.
+  static int32_t GetPcRenderScale() {
+    const int32_t scale = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
+    return scale >= 1 && scale <= 3 ? scale : 1;
+  }
+
+  static void SetPcRenderScale(int32_t scale) {
+    HexicHdApp* app = current_instance_;
+    if (!app || scale < 1 || scale > 3) {
+      return;
+    }
+    if (!rex::cvar::SetFlagByName("resolution_scale", std::to_string(scale))) {
+      return;
+    }
+    SavePcSettings();
+    // Rebuild scale-dependent graphics resources immediately.
+    if (app->runtime() && app->runtime()->graphics_system()) {
+      app->runtime()->graphics_system()->ReinitializeContext();
+    }
   }
 
   static int32_t GetPcResolutionIndex() {
@@ -971,10 +1021,14 @@ inline void HexicSettingsDialog::CycleRow(int row, int delta) {
     case kRowResolution: {
       static const int32_t kW[] = {1280, 1920, 2560, 3840};
       static const int32_t kH[] = {720, 1080, 1440, 2160};
-      static const int32_t kScale[] = {1, 2, 2, 3};
       int index = HexicHdApp::GetPcResolutionIndex();
       index = (index + delta + 4) % 4;
-      HexicHdApp::SetPcResolution(kW[index], kH[index], kScale[index]);
+      HexicHdApp::SetPcResolution(kW[index], kH[index]);
+      break;
+    }
+    case kRowRenderScale: {
+      const int scale = (HexicHdApp::GetPcRenderScale() - 1 + delta + 3) % 3 + 1;
+      HexicHdApp::SetPcRenderScale(scale);
       break;
     }
     case kRowVSync:
@@ -1102,12 +1156,13 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
 
     ImGui::Dummy(window_size);
 
-    DrawHexicCard(draw_list, window_pos, window_end, kSideMargin, "PC SETTINGS");
+    DrawHexicCard(draw_list, window_pos, window_end, kSideMargin, "SETTINGS");
 
     static const char* kRowLabels[kRowCount] = {
         "Player Name",
         "Display Mode",
         "Resolution",
+        "Render Scale",
         "VSync",
         "Show FPS",
         "Keyboard Controls",
@@ -1144,6 +1199,11 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
         case kRowResolution:
           value = kResolutionValues[HexicHdApp::GetPcResolutionIndex()];
           break;
+        case kRowRenderScale: {
+          static const char* kScaleValues[3] = {"1x", "2x", "3x"};
+          value = kScaleValues[HexicHdApp::GetPcRenderScale() - 1];
+          break;
+        }
         case kRowVSync:
           value = HexicHdApp::GetPcVSync() ? "On" : "Off";
           break;

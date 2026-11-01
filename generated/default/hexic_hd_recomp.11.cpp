@@ -1,5 +1,8 @@
 #include "hexic_hd_init.h"
 
+// Hexic: game steps in the timing log (src/main.cpp). Hand edit.
+void HexicNoteGameFrame(uint8_t* base);
+
 DEFINE_REX_FUNC(sub_921A1BC0) {
 	REX_FUNC_PROLOGUE();
 	PPCRegister temp{};
@@ -46446,6 +46449,7 @@ loc_921B5208:
 
 DEFINE_REX_FUNC(sub_921B5218) {
 	REX_FUNC_PROLOGUE();
+	HexicNoteGameFrame(base);  // Hexic hand edit: game steps in the timing log (vblank_timing_log)
 	// lis r11,-28121
 	ctx.r11.s64 = -1842937856;
 	// lwz r10,11896(r11)

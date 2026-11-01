@@ -1,3 +1,69 @@
+diff --git a/include/rex/diag_timing.h b/include/rex/diag_timing.h
+new file mode 100644
+index 0000000..03a10d5
+--- /dev/null
++++ b/include/rex/diag_timing.h
+@@ -0,0 +1,60 @@
++/**
++ * @file        rex/diag_timing.h
++ * @brief       Frame-timing diagnostics shared by the runtime and the GPU plugin.
++ *
++ * Everything here is off unless the cvar vblank_timing_log is true. It exists
++ * so a player who sees stutter can turn it on and send one log that says what
++ * the game was waiting on: slow input, SDL, file or GPU calls each get a line.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++namespace rex::diag {
++
++// vblank_timing_log, read by name (the cvar lives in the runtime, while the GPU
++// plugin is a separate DLL) and re-read at most twice a second so a hot path
++// pays one clock read and one atomic load per call.
++inline bool TimingLogOn() {
++  static std::atomic<int64_t> next_check_ms{0};
++  static std::atomic<bool> on{false};
++  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  if (now_ms >= next_check_ms.load(std::memory_order_relaxed)) {
++    next_check_ms.store(now_ms + 500, std::memory_order_relaxed);
++    on.store(rex::cvar::GetFlagByName("vblank_timing_log") == "true", std::memory_order_relaxed);
++  }
++  return on.load(std::memory_order_relaxed);
++}
++
++// Logs the enclosing call when it took at least min_ms and the log is on.
++class SlowCallTimer {
++ public:
++  SlowCallTimer(const char* what, double min_ms, uint32_t arg = 0)
++      : what_(what), min_ms_(min_ms), arg_(arg), start_(std::chrono::steady_clock::now()) {}
++  ~SlowCallTimer() {
++    const double ms =
++        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_)
++            .count();
++    if (ms >= min_ms_ && TimingLogOn()) {
++      REXLOG_INFO("[timing] slow call: {}({}) {:.2f} ms", what_, arg_, ms);
++    }
++  }
++  SlowCallTimer(const SlowCallTimer&) = delete;
++  SlowCallTimer& operator=(const SlowCallTimer&) = delete;
++
++ private:
++  const char* what_;
++  double min_ms_;
++  uint32_t arg_;
++  std::chrono::steady_clock::time_point start_;
++};
++
++}  // namespace rex::diag
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index 6998a45..c897883 100644
 --- a/include/rex/graphics/command_processor.h
@@ -34,7 +100,7 @@ index 6998a45..c897883 100644
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index d977ebe..80fdcdb 100644
+index d977ebe..bfc4c66 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
 @@ -416,7 +416,49 @@ class D3D12CommandProcessor : public CommandProcessor {
@@ -88,6 +154,47 @@ index d977ebe..80fdcdb 100644
    uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
    void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                   uint64_t samples);
+@@ -656,6 +698,28 @@ class D3D12CommandProcessor : public CommandProcessor {
+   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+ 
++  // vblank_timing_log: GPU time per frame, from timestamp queries around each
++  // submission of the frame. Read back when the frame's slot is reused,
++  // kQueueFrames frames later, after the fence says it has completed.
++  static constexpr uint32_t kGpuTimeStampsPerFrame = 256;
++  void GpuTimeFrameOpen();
++  void GpuTimeSubmissionBegin();
++  void GpuTimeSubmissionEnd(bool is_closing_frame);
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_time_heap_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_time_readback_;
++  uint64_t gpu_time_frequency_ = 0;
++  bool gpu_time_on_ = false;
++  bool gpu_time_failed_ = false;
++  uint32_t gpu_time_count_[kQueueFrames] = {};
++  bool gpu_time_resolved_[kQueueFrames] = {};
++  uint32_t gpu_time_submission_begin_ = UINT32_MAX;
++  uint64_t gpu_time_frames_ = 0;
++  uint64_t gpu_time_submissions_ = 0;
++  double gpu_time_sum_ms_ = 0.0;
++  double gpu_time_sq_ms_ = 0.0;
++  double gpu_time_max_ms_ = 0.0;
++  uint64_t gpu_time_over_8_ = 0, gpu_time_over_12_ = 0, gpu_time_over_16_ = 0;
++
+   static constexpr uint32_t kMaxOcclusionQueries = 8192;
+   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
+   Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index c72380a..d133642 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -15,6 +15,7 @@
+ 
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
++REXCVAR_DECLARE(bool, fixed_guest_vblank);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
 index 942450b..4f848f8 100644
 --- a/include/rex/graphics/graphics_system.h
@@ -110,6 +217,39 @@ index 942450b..4f848f8 100644
    void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                 bool blocking) override;
  
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index b05df6a..99bf41c 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -96,6 +96,11 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // vblank_timing_log: call once per guest frame (when it closes). Every 600
++  // frames logs how much guest memory was uploaded to the GPU per frame, how
++  // much of it was the same as that page's previous upload, and where it went.
++  void NoteFrameForUploadStats();
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+@@ -176,6 +181,16 @@ class SharedMemory {
+   // persistently allocated vector).
+   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+ 
++  // Upload statistics (vblank_timing_log only; see NoteFrameForUploadStats):
++  // a hash of each page as last uploaded, 0 = none or overwritten by the GPU.
++  void CountUploads(const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges);
++  std::vector<uint64_t> upload_stats_hash_;
++  uint64_t upload_stats_bytes_ = 0;
++  uint64_t upload_stats_unchanged_bytes_ = 0;
++  uint64_t upload_stats_ranges_ = 0;
++  uint64_t upload_stats_frames_ = 0;
++  uint64_t upload_stats_by_mb_[kBufferSize >> 20] = {};
++
+   // GPU-written memory downloading for traces. <Start address, length>.
+   std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
+   uint32_t trace_download_page_count_ = 0;
 diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
 index 8f34d97..b8a445d 100644
 --- a/include/rex/input/input_system.h
@@ -537,6 +677,24 @@ index ec37017..a5c8bf2 100644
    std::vector<std::unique_ptr<Setting>> setting_list_;
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..0e2a21d 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,13 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // Whether the window must keep repainting while this dialog is open. A
++  // passive overlay drawn over the game picture returns false: the window then
++  // repaints only when the game shows a new frame. Repainting at the display's
++  // rate (160-240 Hz) for an overlay that never changes cost frames on VRR
++  // screens in the GoldenEye port.
++  virtual bool WantsContinuousRedraw() const { return true; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index c72b628..c18807b 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -572,11 +730,38 @@ index c72b628..c18807b 100644
  };
  
  }  // namespace ui
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..41cb884 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -38,6 +38,13 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
++ public:
++  // Only while a toast is queued or showing (the dialog lives all game).
++  bool WantsContinuousRedraw() const override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return !queue_.empty();
++  }
++
+  private:
+   static constexpr float kDisplaySeconds = 4.5f;
+ 
+@@ -47,7 +54,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+     std::optional<std::chrono::steady_clock::time_point> visible_since;
+   };
+ 
+-  std::mutex mutex_;
++  mutable std::mutex mutex_;
+   std::deque<PendingToast> queue_;
+   AchievementIconCache icon_cache_;
+ };
 diff --git a/include/rex/ui/overlay/debug_overlay.h b/include/rex/ui/overlay/debug_overlay.h
-index e15e410..731ec7c 100644
+index e15e410..b9f236b 100644
 --- a/include/rex/ui/overlay/debug_overlay.h
 +++ b/include/rex/ui/overlay/debug_overlay.h
-@@ -44,4 +44,23 @@ class DebugOverlayDialog : public ImGuiDialog {
+@@ -44,4 +44,26 @@ class DebugOverlayDialog : public ImGuiDialog {
  #endif
  };
  
@@ -591,6 +776,9 @@ index e15e410..731ec7c 100644
 +  void SetStatsProvider(FrameStatsProvider provider) {
 +    stats_provider_ = std::move(provider);
 +  }
++
++  // Passive: its numbers change with the game's frames, which repaint anyway.
++  bool WantsContinuousRedraw() const override { return false; }
 +
 + protected:
 +  void OnDraw(ImGuiIO& io) override;
@@ -695,6 +883,60 @@ index 5d8476f..adf9724 100644
    // Called by SDLWindowedAppContext on the UI thread.
    void HandleWindowEvent(SDL_Event& event);
    void HandleKeyEvent(SDL_Event& event);
+diff --git a/src/core/clock.cpp b/src/core/clock.cpp
+index ae72b7a..ab7923d 100644
+--- a/src/core/clock.cpp
++++ b/src/core/clock.cpp
+@@ -39,6 +39,9 @@ std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
+ uint64_t last_guest_tick_count_ = 0;
+ // Last sampled host tick count.
+ uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
++// What the last host-to-guest conversion left over, in units of
++// guest_tick_ratio_.second, carried into the next one.
++uint64_t guest_tick_remainder_ = 0;
+ // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
+ std::mutex tick_mutex_;
+ 
+@@ -59,6 +62,7 @@ void RecomputeGuestTickScalar() {
+ 
+   std::lock_guard<std::mutex> lock(tick_mutex_);
+   guest_tick_ratio_ = frac;
++  guest_tick_remainder_ = 0;
+ }
+ 
+ // Update the guest timer for all threads.
+@@ -73,13 +77,24 @@ uint64_t UpdateGuestClock() {
+ 
+   std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
+   if (lock.try_lock()) {
+-    // Translate host tick count to guest tick count.
+-    uint64_t host_tick_delta =
+-        host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
+-    last_host_tick_count_ = host_tick_count;
+-    uint64_t guest_tick_delta =
+-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
+-    last_guest_tick_count_ += guest_tick_delta;
++    // Translate host tick count to guest tick count, only ever forwards.
++    // The host count is read before the lock, so a thread held up in
++    // between (an interrupt, a context switch) can find other threads have
++    // already moved the clock past its reading. This used to store that
++    // older reading anyway, and the next update counted the same stretch of
++    // time twice: the guest clock - the game's timebase, its vblank and the
++    // kernel's millisecond tick - ran fast by however often that happened,
++    // which is different on every PC (measured in the Perfect Dark port:
++    // +0.03-0.11% on one PC, +0.24-0.53% on another). The remainder of the conversion is carried rather
++    // than dropped, which ran the clock slow on host counters that do not
++    // divide 50 MHz exactly.
++    if (host_tick_count > last_host_tick_count_) {
++      const uint64_t host_tick_delta = host_tick_count - last_host_tick_count_;
++      last_host_tick_count_ = host_tick_count;
++      const uint64_t scaled = host_tick_delta * guest_tick_ratio_.first + guest_tick_remainder_;
++      last_guest_tick_count_ += scaled / guest_tick_ratio_.second;
++      guest_tick_remainder_ = scaled % guest_tick_ratio_.second;
++    }
+     return last_guest_tick_count_;
+   } else {
+     // Wait until another thread has finished updating the clock.
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
 index a9e42f0..50af3d6 100644
 --- a/src/core/cvar.cpp
@@ -755,8 +997,70 @@ index a9e42f0..50af3d6 100644
        } else {
          result += entry.name + " = " + entry.getter() + "\n";
        }
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..084d8f5 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -21,6 +21,14 @@
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ namespace dp = disruptorplus;
+ 
+ namespace rex::thread {
+@@ -66,10 +74,39 @@ class TimerQueue {
+ 
+     while (!stop_token.stop_requested()) {
+       {
++        const clock::time_point due =
++            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_;
++#if REX_PLATFORM_WIN32
++        // Sleep until the next timer is due, at most 1 ms so new timers are still
++        // picked up within 1 ms, instead of spin-waiting: with the kernel's 1 ms
++        // timestamp timer this thread used 4-10% of a core all session (measured
++        // in PD; GoldenEye found the same, 4-8%).
++        {
++          static thread_local HANDLE sleep_timer = CreateWaitableTimerExW(
++              nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++          const auto now = clock::now();
++          if (sleep_timer && due > now) {
++            const auto sleep_for =
++                std::min<clock::duration>(due - now, std::chrono::milliseconds(1));
++            LARGE_INTEGER due_time;
++            due_time.QuadPart = -std::max<int64_t>(
++                1, std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_for).count() / 100);
++            if (SetWaitableTimer(sleep_timer, &due_time, 0, nullptr, nullptr, FALSE)) {
++              WaitForSingleObject(sleep_timer, INFINITE);
++            }
++          }
++        }
++        // Consume new wait items and add them to sorted wait queue. Checked
++        // without waiting: wait_until_published busy-spins about 4000 pause
++        // instructions before it even looks at its timeout, ~50 us per call on a
++        // Zen 4, which a thousand times a second was the whole 5-7% (GoldenEye's
++        // version of this fix still called it with an expired timeout).
++        dp::sequence_t available = claim_strategy_.last_published_after(next_sequence - 1);
++#else
+         // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++        dp::sequence_t available =
++            claim_strategy_.wait_until_published(next_sequence, next_sequence - 1, due);
++#endif
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..c2f2083 100644
+index 60efcd3..fbfba99 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -239,6 +239,11 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
@@ -779,8 +1083,20 @@ index 60efcd3..c2f2083 100644
  
    ++counter_;
    return true;
+@@ -1172,7 +1178,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+-        if (!REXCVAR_GET(vsync)) {
++        // Spinning here only makes sense when vsync off also speeds up the
++        // guest vblank. With fixed_guest_vblank the game's clock is the same
++        // either way, and yielding kept this thread at ~100% of a core.
++        if (!REXCVAR_GET(vsync) && !REXCVAR_GET(fixed_guest_vblank)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index efed1b7..f862e82 100644
+index efed1b7..e30d8f2 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -10,10 +10,15 @@
@@ -799,7 +1115,15 @@ index efed1b7..f862e82 100644
  
  #include <rex/assert.h>
  #include <rex/cvar.h>
-@@ -32,6 +37,9 @@
+@@ -22,6 +27,7 @@
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/graphics_system.h>
+ #include <rex/graphics/d3d12/shader.h>
++#include <rex/diag_timing.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
+@@ -32,6 +38,9 @@
  #include <rex/ui/d3d12/d3d12_presenter.h>
  #include <rex/ui/d3d12/d3d12_util.h>
  
@@ -809,7 +1133,7 @@ index efed1b7..f862e82 100644
  REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
-@@ -172,9 +180,39 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+@@ -172,9 +181,39 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
    render_target_cache_->RestoreEdramSnapshot(snapshot);
  }
  
@@ -849,7 +1173,7 @@ index efed1b7..f862e82 100644
      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
    }
  
-@@ -187,56 +225,212 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+@@ -187,56 +226,212 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
    auto* sample_counts =
        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
    if (!sample_counts) {
@@ -1029,7 +1353,7 @@ index efed1b7..f862e82 100644
 +        occlusion_pending_.back().has_query = true;
 +      }
 +    }
-+  }
+   }
 +  bool resolved = false;
 +  if (!occlusion_pending_.empty() && occlusion_query_heap_ && occlusion_query_readback_) {
 +    bool any_query = false;
@@ -1067,7 +1391,7 @@ index efed1b7..f862e82 100644
 +      occlusion_running_total_ +=
 +          NormalizeOcclusionSamples(occlusion_query_readback_mapping_[snapshot.host_index]);
 +    }
-   }
++  }
 +  if (!occlusion_pending_.empty()) {
 +    g_gpu_perf.resolve_ms += std::chrono::duration<double, std::milli>(
 +                                 std::chrono::steady_clock::now() - resolve_start)
@@ -1097,7 +1421,7 @@ index efed1b7..f862e82 100644
  }
  
  bool D3D12CommandProcessor::PushTransitionBarrier(ID3D12Resource* resource,
-@@ -1917,6 +2111,28 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -1917,6 +2112,28 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
  
  void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
@@ -1126,7 +1450,7 @@ index efed1b7..f862e82 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +2508,125 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+@@ -2292,6 +2509,125 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -1252,7 +1576,7 @@ index efed1b7..f862e82 100644
  bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
-@@ -2299,6 +2634,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2299,6 +2635,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -1260,7 +1584,7 @@ index efed1b7..f862e82 100644
    ID3D12Device* device = GetD3D12Provider().GetDevice();
    const RegisterFile& regs = *register_file_;
  
-@@ -2351,6 +2687,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2351,6 +2688,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
    bool memexport_used = memexport_used_vertex || memexport_used_pixel;
  
@@ -1271,7 +1595,141 @@ index efed1b7..f862e82 100644
    if (!BeginSubmission(true)) {
      return false;
    }
-@@ -3444,6 +3784,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3158,9 +3499,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (queue_operations_done_since_submission_signal_) {
+       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
+       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
+-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
+-                        fence_value, fence_completion_event_)))) {
++      // Each result checked on its own: SUCCEEDED(a && b) turned the two HRESULTs
++      // into a bool first, so a failed Signal counted as success (from GoldenEye).
++      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value)) &&
++          SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
++              fence_value, fence_completion_event_))) {
+         PROFILE_CMD_BUFFER_STALL();
+         WaitForSingleObject(fence_completion_event_, INFINITE);
+         queue_operations_done_since_submission_signal_ = false;
+@@ -3418,11 +3761,118 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_processor_->BeginFrame();
+ 
+     texture_cache_->BeginFrame();
++
++    GpuTimeFrameOpen();
++  }
++
++  if (frame_open_ && gpu_time_on_ && gpu_time_submission_begin_ == UINT32_MAX) {
++    GpuTimeSubmissionBegin();
+   }
+ 
+   return true;
+ }
+ 
++void D3D12CommandProcessor::GpuTimeFrameOpen() {
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  // The frame that last used this slot has completed: BeginSubmission awaited
++  // its submission before opening this frame.
++  if (gpu_time_resolved_[slot] && gpu_time_frequency_ && gpu_time_count_[slot] >= 2) {
++    void* mapped = nullptr;
++    const D3D12_RANGE read_range = {slot * kGpuTimeStampsPerFrame * sizeof(uint64_t),
++                                    (slot + 1) * kGpuTimeStampsPerFrame * sizeof(uint64_t)};
++    if (SUCCEEDED(gpu_time_readback_->Map(0, &read_range, &mapped))) {
++      const uint64_t* stamps = static_cast<const uint64_t*>(mapped) + slot * kGpuTimeStampsPerFrame;
++      const double to_ms = 1000.0 / double(gpu_time_frequency_);
++      double frame_ms = 0.0;
++      for (uint32_t i = 0; i + 1 < gpu_time_count_[slot]; i += 2) {
++        if (stamps[i + 1] > stamps[i]) frame_ms += double(stamps[i + 1] - stamps[i]) * to_ms;
++      }
++      const D3D12_RANGE written_range = {};
++      gpu_time_readback_->Unmap(0, &written_range);
++      ++gpu_time_frames_;
++      gpu_time_submissions_ += gpu_time_count_[slot] / 2;
++      gpu_time_sum_ms_ += frame_ms;
++      gpu_time_sq_ms_ += frame_ms * frame_ms;
++      gpu_time_max_ms_ = std::max(gpu_time_max_ms_, frame_ms);
++      gpu_time_over_8_ += frame_ms > 8.0;
++      gpu_time_over_12_ += frame_ms > 12.0;
++      gpu_time_over_16_ += frame_ms > 1000.0 / 60.0;
++      if (gpu_time_frames_ >= 600) {
++        const double n = double(gpu_time_frames_);
++        const double mean = gpu_time_sum_ms_ / n;
++        REXGPU_INFO("[timing] gpu time per frame: {:.2f} ms mean (sd {:.2f}), max {:.2f}, in "
++                    "{:.1f} submissions; frames over 8 ms {}, over 12 ms {}, over 16.7 ms {}",
++                    mean, std::sqrt(std::max(0.0, gpu_time_sq_ms_ / n - mean * mean)),
++                    gpu_time_max_ms_, double(gpu_time_submissions_) / n, gpu_time_over_8_,
++                    gpu_time_over_12_, gpu_time_over_16_);
++        gpu_time_frames_ = gpu_time_submissions_ = 0;
++        gpu_time_sum_ms_ = gpu_time_sq_ms_ = gpu_time_max_ms_ = 0.0;
++        gpu_time_over_8_ = gpu_time_over_12_ = gpu_time_over_16_ = 0;
++      }
++    }
++  }
++  gpu_time_resolved_[slot] = false;
++  gpu_time_count_[slot] = 0;
++  gpu_time_submission_begin_ = UINT32_MAX;
++
++  gpu_time_on_ = rex::diag::TimingLogOn() && !gpu_time_failed_;
++  if (gpu_time_on_ && !gpu_time_heap_) {
++    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++    ID3D12Device* device = provider.GetDevice();
++    D3D12_QUERY_HEAP_DESC heap_desc = {};
++    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    heap_desc.Count = kQueueFrames * kGpuTimeStampsPerFrame;
++    D3D12_RESOURCE_DESC buffer_desc;
++    ui::d3d12::util::FillBufferResourceDesc(
++        buffer_desc, kQueueFrames * kGpuTimeStampsPerFrame * sizeof(uint64_t),
++        D3D12_RESOURCE_FLAG_NONE);
++    UINT64 frequency = 0;
++    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_time_heap_))) ||
++        FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
++            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++            IID_PPV_ARGS(&gpu_time_readback_))) ||
++        FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frequency)) || !frequency) {
++      REXGPU_WARN("[timing] gpu time: timestamp queries unavailable");
++      gpu_time_heap_.Reset();
++      gpu_time_readback_.Reset();
++      gpu_time_failed_ = true;
++      gpu_time_on_ = false;
++    } else {
++      gpu_time_frequency_ = frequency;
++    }
++  }
++}
++
++void D3D12CommandProcessor::GpuTimeSubmissionBegin() {
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  uint32_t& count = gpu_time_count_[slot];
++  if (!submission_open_ || count + 2 > kGpuTimeStampsPerFrame) {
++    return;
++  }
++  gpu_time_submission_begin_ = count++;
++  deferred_command_list_.D3DEndQuery(gpu_time_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     slot * kGpuTimeStampsPerFrame + gpu_time_submission_begin_);
++}
++
++void D3D12CommandProcessor::GpuTimeSubmissionEnd(bool is_closing_frame) {
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  uint32_t& count = gpu_time_count_[slot];
++  if (gpu_time_submission_begin_ != UINT32_MAX) {
++    // Barriers queued so far belong to the work before this point.
++    SubmitBarriers();
++    deferred_command_list_.D3DEndQuery(gpu_time_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                       slot * kGpuTimeStampsPerFrame + count++);
++    gpu_time_submission_begin_ = UINT32_MAX;
++  }
++  if (is_closing_frame && gpu_time_heap_ && count) {
++    deferred_command_list_.D3DResolveQueryData(
++        gpu_time_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kGpuTimeStampsPerFrame, count,
++        gpu_time_readback_.Get(), slot * kGpuTimeStampsPerFrame * sizeof(uint64_t));
++    gpu_time_resolved_[slot] = true;
++  }
++}
++
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+ 
+@@ -3444,6 +3894,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    }
  
    bool is_closing_frame = is_swap && frame_open_;
@@ -1279,7 +1737,7 @@ index efed1b7..f862e82 100644
  
    if (is_closing_frame) {
      texture_cache_->EndFrame();
-@@ -3455,8 +3796,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3455,13 +3906,21 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
      assert_false(scratch_buffer_used_);
  
      if (active_occlusion_query_.valid && occlusion_query_heap_) {
@@ -1294,7 +1752,24 @@ index efed1b7..f862e82 100644
        active_occlusion_query_ = {};
      }
  
-@@ -4865,6 +5212,13 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
+     pipeline_cache_->EndSubmission();
+ 
++    GpuTimeSubmissionEnd(is_closing_frame);
++
+     // Submit barriers now because resources with the queued barriers may be
+     // destroyed between frames.
+     SubmitBarriers();
+@@ -3504,6 +3963,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   }
+ 
+   if (is_closing_frame) {
++    if (shared_memory_) {
++      shared_memory_->NoteFrameForUploadStats();
++    }
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+     }
+@@ -4865,6 +5327,13 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
  bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
    active_occlusion_query_ = {};
    occlusion_query_cursor_ = 0;
@@ -1308,7 +1783,7 @@ index efed1b7..f862e82 100644
    occlusion_query_resources_available_ = false;
    occlusion_query_heap_.Reset();
    occlusion_query_readback_.Reset();
-@@ -4916,7 +5270,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
+@@ -4916,7 +5385,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
  }
  
  void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
@@ -1317,7 +1792,7 @@ index efed1b7..f862e82 100644
  
    if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
      occlusion_query_readback_->Unmap(0, nullptr);
-@@ -4934,7 +5288,66 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
+@@ -4934,7 +5403,66 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
    return true;
  }
  
@@ -1385,7 +1860,7 @@ index efed1b7..f862e82 100644
    if (active_occlusion_query_.valid && occlusion_query_heap_) {
      uint32_t host_index = active_occlusion_query_.host_index;
      // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
-@@ -4949,6 +5362,13 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+@@ -4949,6 +5477,13 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
      active_occlusion_query_ = {};
    }
    occlusion_query_cursor_ = 0;
@@ -1399,7 +1874,7 @@ index efed1b7..f862e82 100644
    occlusion_query_resources_available_ = false;
  }
  
-@@ -4959,7 +5379,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
+@@ -4959,7 +5494,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
    if (active_occlusion_query_.valid) {
      REXGPU_WARN(
          "D3D12CommandProcessor: Occlusion query begin issued while another query is active");
@@ -1408,7 +1883,7 @@ index efed1b7..f862e82 100644
      return false;
    }
  
-@@ -5036,7 +5456,11 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
+@@ -5036,7 +5571,11 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
    if (!sample_counts) {
      return;
    }
@@ -1422,10 +1897,43 @@ index efed1b7..f862e82 100644
    sample_counts->Total_B = 0;
    sample_counts->ZPass_A = clamped;
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 3877b1a..ebe85e2 100644
+index 3877b1a..bc40309 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -42,6 +42,10 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cmath>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -20,6 +21,7 @@
+ #include <utility>
+ 
+ #include <rex/cvar.h>
++#include <rex/diag_timing.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+@@ -31,6 +33,16 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#if REX_PLATFORM_WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
+ 
+ REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+@@ -42,6 +54,18 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
  REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                      "Store shaders persistently and load them when loading games to avoid "
                      "runtime spikes and freezes when playing the game not for the first time.");
@@ -1433,10 +1941,18 @@ index 3877b1a..ebe85e2 100644
 +                    "Keep the guest's vblank at the video mode's refresh rate even with vsync "
 +                    "off, for games whose speed follows vblanks; vsync then only affects how "
 +                    "frames reach the screen.");
++// How long the vblank thread yield-spins before each tick, after sleeping on a
++// high-resolution timer until then. Shorter spends less CPU; too short and a
++// late timer wake-up makes the tick late (measured in the Perfect Dark port:
++// 1000 us kept ticks within +-0.1 ms, 250 us let them slip by +-0.7 ms).
++REXCVAR_DEFINE_INT32(vblank_spin_us, 1000, "GPU",
++                     "Guest vblank: microseconds to yield-spin before each tick (after a "
++                     "timer sleep); less uses less CPU, too little makes ticks late")
++    .range(100, 4000);
  
  namespace {
  
-@@ -80,6 +84,10 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+@@ -80,6 +104,10 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
  
  GraphicsSystem::~GraphicsSystem() = default;
  
@@ -1447,8 +1963,28 @@ index 3877b1a..ebe85e2 100644
  X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
    if (presenter_) {
      return X_STATUS_SUCCESS;
-@@ -164,8 +172,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -162,16 +190,100 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
          uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // The vblank paces the game's frames, so it has to tick evenly.
++        // Sleeping 1 ms per loop fired it up to 2 ms late or early (ticks
++        // 14.2-19.2 ms apart). Now: wait on a high-resolution timer until
++        // shortly before the deadline (vblank_spin_us), then yield until it.
++        // The rate itself is unchanged.
++#if REX_PLATFORM_WIN32
++        HANDLE wait_timer = CreateWaitableTimerExW(
++            nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++            TIMER_ALL_ACCESS);
++        if (!wait_timer) {
++          wait_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
++        }
++#endif
++        // Sleep at most 4 ms per pass, so cvar changes apply quickly.
++        const uint64_t max_sleep_ticks = std::max(uint64_t(1), guest_tick_frequency / 250);
++        // vblank_timing_log: tick spacing every 10 s.
++        uint64_t log_start = last_frame_time, stat_count = 0, prev_fire = 0;
++        double stat_sum = 0.0, stat_sq = 0.0, stat_min = 1e9, stat_max = 0.0;
          while (vsync_worker_running_) {
            uint64_t current_time = chrono::Clock::QueryGuestTickCount();
 -          uint64_t interval_ticks =
@@ -1459,10 +1995,79 @@ index 3877b1a..ebe85e2 100644
 +          uint64_t interval_ticks = (REXCVAR_GET(vsync) || REXCVAR_GET(fixed_guest_vblank))
 +                                        ? vsync_interval_ticks
 +                                        : no_vsync_interval_ticks;
++          bool fired = false;
            while (current_time - last_frame_time >= interval_ticks) {
              MarkVblank();
              last_frame_time += interval_ticks;
-@@ -348,6 +360,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
++            fired = true;
++          }
++          if (fired && rex::diag::TimingLogOn()) {
++            if (prev_fire) {
++              const double us =
++                  double(current_time - prev_fire) * 1e6 / double(guest_tick_frequency);
++              ++stat_count;
++              stat_sum += us;
++              stat_sq += us * us;
++              stat_min = std::min(stat_min, us);
++              stat_max = std::max(stat_max, us);
++            }
++            prev_fire = current_time;
++            if (current_time - log_start >= guest_tick_frequency * 10 && stat_count) {
++              const double mean = stat_sum / double(stat_count);
++              const double sd =
++                  std::sqrt(std::max(0.0, stat_sq / double(stat_count) - mean * mean));
++              REXLOG_INFO("[timing] vblank: {} ticks, interval mean {:.3f} ms sd {:.3f} "
++                          "min {:.3f} max {:.3f}",
++                          stat_count, mean / 1000.0, sd / 1000.0, stat_min / 1000.0,
++                          stat_max / 1000.0);
++              log_start = current_time;
++              stat_count = 0;
++              stat_sum = stat_sq = 0.0;
++              stat_min = 1e9;
++              stat_max = 0.0;
++            }
++          } else if (fired) {
++            prev_fire = 0;
++          }
++          // Wait for the next deadline: a timer sleep (at most 4 ms per pass),
++          // then yield through the last vblank_spin_us.
++          current_time = chrono::Clock::QueryGuestTickCount();
++          const uint64_t elapsed = current_time - last_frame_time;
++          if (elapsed >= interval_ticks) continue;
++          const uint64_t remaining = interval_ticks - elapsed;
++          // At most a quarter of the interval: with vsync off the vblank runs at
++          // 1000 Hz, and a 1 ms spin there kept this thread spinning all the time.
++          const uint64_t spin_ticks = std::max(
++              uint64_t(1),
++              std::min(guest_tick_frequency * uint64_t(REXCVAR_GET(vblank_spin_us)) / 1000000,
++                       interval_ticks / 4));
++          if (remaining > spin_ticks) {
++            const uint64_t sleep_ticks = std::min(remaining - spin_ticks, max_sleep_ticks);
++#if REX_PLATFORM_WIN32
++            if (wait_timer) {
++              LARGE_INTEGER due;
++              due.QuadPart = -int64_t(sleep_ticks * 10000000ull / guest_tick_frequency);
++              if (due.QuadPart < 0 &&
++                  SetWaitableTimer(wait_timer, &due, 0, nullptr, nullptr, FALSE)) {
++                WaitForSingleObject(wait_timer, INFINITE);
++                continue;
++              }
++            }
++#endif
++            rex::thread::Sleep(
++                std::chrono::microseconds(sleep_ticks * 1000000ull / guest_tick_frequency));
++          } else {
++            rex::thread::MaybeYield();
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
++#if REX_PLATFORM_WIN32
++        if (wait_timer) CloseHandle(wait_timer);
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+@@ -348,6 +460,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
    command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
  }
  
@@ -1485,11 +2090,118 @@ index 3877b1a..ebe85e2 100644
  void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                               uint32_t title_id, bool blocking) {
    if (!REXCVAR_GET(store_shaders)) {
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 333becb..e22b5c3 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -16,6 +16,7 @@
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/diag_timing.h>
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+@@ -323,6 +324,13 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   // the texture.
+   FireWatches(page_first, page_last, true);
+ 
++  // The buffer no longer holds these pages' last upload (upload statistics).
++  if (!upload_stats_hash_.empty()) {
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      upload_stats_hash_[page] = 0;
++    }
++  }
++
+   // Mark the range as valid (so pages are not reuploaded until modified by the
+   // CPU) and watch it so the CPU can reuse it and this will be caught.
+   MakeRangeValid(start, length, true);
+@@ -570,9 +578,72 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  if (rex::diag::TimingLogOn()) {
++    CountUploads(upload_ranges_);
++  }
+   return UploadRanges(upload_ranges_);
+ }
+ 
++void SharedMemory::CountUploads(const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) {
++  const uint32_t page_size = uint32_t(1) << page_size_log2_;
++  if (upload_stats_hash_.empty()) {
++    upload_stats_hash_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  }
++  for (const auto& range : page_ranges) {
++    upload_stats_ranges_++;
++    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
++      const uint32_t address = page << page_size_log2_;
++      if (address >= kBufferSize) break;
++      const uint8_t* data = memory_.TranslatePhysical(address);
++      // A cheap 64-bit hash of the page; never 0, which means "no upload yet".
++      uint64_t hash = 0x9E3779B97F4A7C15ull;
++      for (uint32_t i = 0; i < page_size; i += 8) {
++        uint64_t word;
++        std::memcpy(&word, data + i, 8);
++        hash = (hash ^ word) * 0x100000001B3ull;
++        hash ^= hash >> 29;
++      }
++      hash |= 1;
++      if (upload_stats_hash_[page] == hash) {
++        upload_stats_unchanged_bytes_ += page_size;
++      }
++      upload_stats_hash_[page] = hash;
++      upload_stats_bytes_ += page_size;
++      upload_stats_by_mb_[address >> 20] += page_size;
++    }
++  }
++}
++
++void SharedMemory::NoteFrameForUploadStats() {
++  if (!rex::diag::TimingLogOn()) {
++    return;
++  }
++  if (++upload_stats_frames_ < 600) {
++    return;
++  }
++  const double frames = double(upload_stats_frames_);
++  std::vector<std::pair<uint64_t, uint32_t>> regions;
++  for (uint32_t i = 0; i < uint32_t(kBufferSize >> 20); ++i) {
++    if (upload_stats_by_mb_[i]) regions.emplace_back(upload_stats_by_mb_[i], i);
++  }
++  std::sort(regions.rbegin(), regions.rend());
++  std::string by_mb;
++  for (size_t i = 0; i < regions.size() && i < 8; ++i) {
++    by_mb += fmt::format(" {:03X}xxxxx:{:.0f}KB", regions[i].second,
++                         double(regions[i].first) / 1024.0 / frames);
++  }
++  REXGPU_INFO("[timing] gpu uploads: {:.0f} KB per frame in {:.1f} ranges, {:.0f}% the same as "
++              "that page's previous upload; by physical MB per frame:{}",
++              double(upload_stats_bytes_) / 1024.0 / frames, double(upload_stats_ranges_) / frames,
++              upload_stats_bytes_
++                  ? 100.0 * double(upload_stats_unchanged_bytes_) / double(upload_stats_bytes_)
++                  : 0.0,
++              by_mb.empty() ? std::string(" none") : by_mb);
++  upload_stats_bytes_ = upload_stats_unchanged_bytes_ = upload_stats_ranges_ = 0;
++  upload_stats_frames_ = 0;
++  std::fill(std::begin(upload_stats_by_mb_), std::end(upload_stats_by_mb_), uint64_t(0));
++}
++
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+   std::pair<uint32_t, uint32_t> range(start, length);
+   return RequestRanges(&range, 1);
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
-index e132acb..3819a3c 100644
+index e132acb..3c94f5a 100644
 --- a/src/input/input_system.cpp
 +++ b/src/input/input_system.cpp
-@@ -57,6 +57,10 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+@@ -13,6 +13,7 @@
+ #include <cmath>
+ 
+ #include <rex/dbg.h>
++#include <rex/diag_timing.h>
+ #include <rex/input/flags.h>
+ #include <rex/input/input_driver.h>
+ #include <rex/input/input_system.h>
+@@ -57,9 +58,14 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
    }
  }
  
@@ -1500,7 +2212,19 @@ index e132acb..3819a3c 100644
  X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                        X_INPUT_CAPABILITIES* out_caps) {
    SCOPE_profile_cpu_f("hid");
-@@ -120,6 +124,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  rex::diag::SlowCallTimer timer("input GetCapabilities", 2.0, user_index);
+ 
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+@@ -76,6 +82,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  rex::diag::SlowCallTimer timer("input GetState", 2.0, user_index);
+ 
+   bool any_connected = false;
+   bool first_result = true;
+@@ -120,6 +127,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
      return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -1511,8 +2235,19 @@ index e132acb..3819a3c 100644
    if (out_state) {
      *out_state = merged;
    }
-@@ -147,16 +155,25 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+@@ -128,6 +139,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
    SCOPE_profile_cpu_f("hid");
++  rex::diag::SlowCallTimer timer("input SetState", 2.0, user_index);
+ 
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+@@ -145,18 +157,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  rex::diag::SlowCallTimer timer("input GetKeystroke", 2.0, user_index);
  
    bool any_connected = false;
 +  bool any_polled = false;
@@ -3380,6 +4115,140 @@ index 8778066..47e2a80 100644
  REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
  REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
  REX_EXPORT_STUB(__imp__XamUserGetAge);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a852..bf28e2a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -488,7 +488,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+ 
+   auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
+   if (!port) {
+-    status = X_STATUS_INVALID_HANDLE;
++    return X_STATUS_INVALID_HANDLE;  // upstream 0c7b01a: never wait on a missing port
+   }
+ 
+   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..2806cd0 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -14,9 +14,15 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <cmath>
+ #include <string>
++#include <thread>
++#include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/diag_timing.h>
++#include <rex/system/thread_state.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/register_file.h>
+ #include <rex/graphics/video_mode_util.h>
+@@ -86,6 +92,92 @@ void WarnNoGpuEmulation(const char* export_name, std::atomic<bool>& warned) {
+ }  // namespace
+ 
+ namespace rex::kernel::xboxkrnl {
++
++// vblank_timing_log: the game's own frame times (one VdSwap per frame), each
++// frame over 25 ms on its own line, and a sampler that records where the
++// thread that presents frames is (its guest return address) when a frame is
++// late, so a stutter report says what the game was waiting on.
++namespace {
++using TimingClock = std::chrono::steady_clock;
++std::atomic<int64_t> g_last_swap_ns{0};
++std::atomic<uint64_t> g_swap_count{0};
++std::atomic<PPCContext*> g_swap_ctx{nullptr};
++
++int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             TimingClock::now().time_since_epoch())
++      .count();
++}
++
++void StallSamplerThread() {
++  uint64_t sampled_for = 0;
++  int samples = 0;
++  for (;;) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    if (!rex::diag::TimingLogOn()) continue;
++    const int64_t last = g_last_swap_ns.load(std::memory_order_relaxed);
++    PPCContext* ctx = g_swap_ctx.load(std::memory_order_relaxed);
++    if (!last || !ctx) continue;
++    const uint64_t frame = g_swap_count.load(std::memory_order_relaxed);
++    if (frame != sampled_for) {
++      sampled_for = frame;
++      samples = 0;
++    }
++    const double late_ms = double(NowNs() - last) / 1e6;
++    // Up to three samples per late frame, at about +28, +53 and +78 ms.
++    if (samples < 3 && late_ms >= 28.0 + 25.0 * samples && late_ms < 2000.0) {
++      ++samples;
++      REXLOG_INFO("[timing] late frame +{:.0f} ms: presenting thread at guest lr 0x{:08X}",
++                  late_ms, uint32_t(ctx->lr));
++    }
++  }
++}
++
++void NoteGuestFrame() {
++  if (!rex::diag::TimingLogOn()) {
++    g_last_swap_ns.store(0, std::memory_order_relaxed);
++    return;
++  }
++  static std::atomic<bool> sampler_started{false};
++  if (!sampler_started.exchange(true)) std::thread(StallSamplerThread).detach();
++  if (auto* ts = rex::runtime::ThreadState::Get()) {
++    g_swap_ctx.store(ts->context(), std::memory_order_relaxed);
++  }
++  static std::vector<double> frame_ms;
++  static int64_t window_start = 0;
++  const int64_t now = NowNs();
++  const int64_t prev = g_last_swap_ns.exchange(now, std::memory_order_relaxed);
++  g_swap_count.fetch_add(1, std::memory_order_relaxed);
++  if (!window_start) window_start = now;
++  if (prev) {
++    const double ms = double(now - prev) / 1e6;
++    frame_ms.push_back(ms);
++    if (ms > 25.0 && ms < 2000.0) {
++      REXLOG_INFO("[timing] slow frame: {:.1f} ms", ms);
++    }
++  }
++  if (now - window_start >= 10'000'000'000ll && !frame_ms.empty()) {
++    double sum = 0.0, sq = 0.0, mx = 0.0;
++    for (double v : frame_ms) {
++      sum += v;
++      sq += v * v;
++      mx = std::max(mx, v);
++    }
++    const double mean = sum / double(frame_ms.size());
++    int hitches = 0;  // over 1.5x the average: a stutter you can feel
++    for (double v : frame_ms) hitches += v > mean * 1.5 ? 1 : 0;
++    std::vector<double> sorted = frame_ms;
++    std::sort(sorted.begin(), sorted.end());
++    REXLOG_INFO("[timing] frames: {} frames, {:.2f} fps, frame time mean {:.3f} ms sd {:.3f} "
++                "p99 {:.2f} max {:.2f}, {} hitches (>1.5x mean)",
++                frame_ms.size(), 1000.0 / mean, mean,
++                std::sqrt(std::max(0.0, sq / double(frame_ms.size()) - mean * mean)),
++                sorted[size_t(double(sorted.size() - 1) * 0.99)], mx, hitches);
++    frame_ms.clear();
++    window_start = now;
++  }
++}
++}  // namespace
+ using namespace rex::system;
+ 
+ REX_EXPORT_STUB(__imp__VdBlockUntilGUIIdle);
+@@ -445,6 +537,7 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
+                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
+                   mapped_u32 height) {
++  NoteGuestFrame();
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
 index 67f7070..aafe09d 100644
 --- a/src/system/function_dispatcher.cpp
@@ -3471,6 +4340,177 @@ index ca7f4e8..a90f9ec 100644
    return true;
  }
  
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..7b4672a 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
++#include <rex/diag_timing.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+@@ -1155,9 +1156,157 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  //
++  // V-Sync on drops ALLOW_TEARING: the flip model then shows the newest frame
++  // at the display's next refresh, so there is no tearing, and this thread
++  // still never waits (sync interval 1 blocked the UI thread, which also
++  // handles input: ~40 fps and input lag in the GoldenEye port). V-Sync off
++  // keeps the immediate, tearing present for the lowest latency and VRR. The
++  // cvar lives in the GPU plugin, so it is read by name, a few times a second.
++  static uint32_t vsync_poll = 0;
++  static bool vsync = true;
++  if ((vsync_poll++ & 0x1F) == 0) vsync = rex::cvar::GetFlagByName("vsync") != "false";
+   HRESULT present_result = paint_context_.swap_chain->Present(
+       0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++             (!vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING
++                                                                 : 0));
++  // vblank_timing_log: presents per second and their spacing, every 10 s
++  // (what actually reaches the screen).
++  {
++    static LARGE_INTEGER freq{}, start{}, prev{};
++    static uint64_t count = 0;
++    static double sum = 0.0, sq = 0.0, mx = 0.0;
++    if (rex::diag::TimingLogOn()) {
++      LARGE_INTEGER now;
++      QueryPerformanceCounter(&now);
++      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++      // What the display actually showed (DXGI frame statistics, from the
++      // GoldenEye port): frames shown against refreshes, with the times of
++      // repeats (a frame held an extra refresh) and drops (two presents in one
++      // refresh). When the game's 60 fps matches the refresh rate these should
++      // be rare; on a 100 or 144 Hz screen without VRR, frames take one or two
++      // refreshes by nature, so repeats there are expected. Also the time from
++      // Present to the refresh that showed the frame, and the longest gap
++      // between frames reaching the screen: a GPU stall shows here even on a
++      // VRR screen, where nothing is repeated.
++      {
++        static UINT last_present_count = 0, last_refresh_count = 0;
++        static uint64_t refreshes = 0, shown = 0, repeats = 0, drops = 0, events = 0;
++        static LARGE_INTEGER window_start{};
++        static std::string event_times;
++        static int64_t present_qpc[64] = {};
++        static LARGE_INTEGER last_sync_qpc{};
++        static uint64_t latency_n = 0, late = 0, gaps = 0;
++        static double latency_sum = 0.0, latency_max = 0.0, gap_max = 0.0;
++        static double latency_usual = 0.0;  // slow running average, kept across windows
++        static std::string late_times;
++        {
++          UINT last_id = 0;
++          if (SUCCEEDED(paint_context_.swap_chain->GetLastPresentCount(&last_id))) {
++            present_qpc[last_id & 63] = now.QuadPart;
++          }
++        }
++        DXGI_FRAME_STATISTICS fs;
++        if (SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&fs)) && fs.PresentCount) {
++          if (!window_start.QuadPart) window_start = now;
++          const double to_ms = 1000.0 / double(freq.QuadPart);
++          if (fs.PresentCount != last_present_count && fs.SyncQPCTime.QuadPart) {
++            const int64_t called = present_qpc[fs.PresentCount & 63];
++            if (called && fs.SyncQPCTime.QuadPart >= called) {
++              const double latency = double(fs.SyncQPCTime.QuadPart - called) * to_ms;
++              if (latency < 500.0) {
++                const bool is_late = latency_usual > 0.0 && latency > latency_usual + 6.0;
++                latency_usual = latency_usual > 0.0
++                                    ? latency_usual + (latency - latency_usual) * 0.02
++                                    : latency;
++                ++latency_n;
++                latency_sum += latency;
++                latency_max = std::max(latency_max, latency);
++                if (is_late && ++late <= 6) {
++                  late_times += fmt::format(
++                      " {:.2f}s ({:.1f} ms)",
++                      double(now.QuadPart - window_start.QuadPart) / double(freq.QuadPart),
++                      latency);
++                }
++              }
++            }
++            if (last_sync_qpc.QuadPart && fs.PresentCount == last_present_count + 1) {
++              const double gap = double(fs.SyncQPCTime.QuadPart - last_sync_qpc.QuadPart) * to_ms;
++              gap_max = std::max(gap_max, gap);
++              if (gap > 25.0) ++gaps;
++            }
++            last_sync_qpc = fs.SyncQPCTime;
++          }
++          if (last_present_count && fs.PresentCount != last_present_count) {
++            const int64_t dp = int64_t(fs.PresentCount) - int64_t(last_present_count);
++            const int64_t dr = int64_t(fs.PresentRefreshCount) - int64_t(last_refresh_count);
++            if (dp > 0 && dr >= 0 && dp < 1000 && dr < 1000) {
++              shown += uint64_t(dp);
++              refreshes += uint64_t(dr);
++              if (dr != dp) {
++                if (dr > dp) {
++                  repeats += uint64_t(dr - dp);
++                } else {
++                  drops += uint64_t(dp - dr);
++                }
++                if (++events <= 6) {
++                  event_times += fmt::format(
++                      " {}{:.2f}s", dr > dp ? "+" : "-",
++                      double(now.QuadPart - window_start.QuadPart) / double(freq.QuadPart));
++                }
++              }
++            }
++          }
++          if (fs.PresentCount != last_present_count) {
++            last_present_count = fs.PresentCount;
++            last_refresh_count = fs.PresentRefreshCount;
++          }
++          if (double(now.QuadPart - window_start.QuadPart) >= 10.0 * double(freq.QuadPart)) {
++            REXLOG_INFO("[timing] display: {} frames shown over {} refreshes, {} repeated, {} "
++                        "dropped{}{}",
++                        shown, refreshes, repeats, drops, events ? "; at" : "",
++                        events > 6 ? event_times + " ..." : event_times);
++            if (latency_n) {
++              REXLOG_INFO("[timing] display: present to screen {:.1f} ms mean, {:.1f} max; {} "
++                          "late frames (over 6 ms later than usual){}{}; longest gap between "
++                          "frames on screen {:.1f} ms ({} over 25 ms)",
++                          latency_sum / double(latency_n), latency_max, late, late ? " at" : "",
++                          late > 6 ? late_times + " ..." : late_times, gap_max, gaps);
++            }
++            window_start = now;
++            refreshes = shown = repeats = drops = events = 0;
++            event_times.clear();
++            latency_n = late = gaps = 0;
++            latency_sum = latency_max = gap_max = 0.0;
++            late_times.clear();
++          }
++        }
++      }
++      if (prev.QuadPart) {
++        const double ms = double(now.QuadPart - prev.QuadPart) * 1000.0 / double(freq.QuadPart);
++        ++count;
++        sum += ms;
++        sq += ms * ms;
++        mx = std::max(mx, ms);
++      } else {
++        start = now;
++      }
++      prev = now;
++      if (double(now.QuadPart - start.QuadPart) >= 10.0 * double(freq.QuadPart) && count) {
++        const double mean = sum / double(count);
++        REXLOG_INFO("[timing] present: {} presents ({:.1f}/s), interval mean {:.3f} ms sd {:.3f} "
++                    "max {:.3f}, vsync {}",
++                    count,
++                    double(count) * double(freq.QuadPart) / double(now.QuadPart - start.QuadPart),
++                    mean, std::sqrt(std::max(0.0, sq / double(count) - mean * mean)), mx, vsync);
++        start = now;
++        count = 0;
++        sum = sq = mx = 0.0;
++      }
++    } else {
++      prev.QuadPart = 0;
++    }
++  }
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
 diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
 index bf8252b..536e157 100644
 --- a/src/ui/d3d12/d3d12_provider.cpp
@@ -3492,10 +4532,18 @@ index bf8252b..536e157 100644
    return true;
  }
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
-index 97b3131..124b627 100644
+index 97b3131..89c5ba6 100644
 --- a/src/ui/imgui_drawer.cpp
 +++ b/src/ui/imgui_drawer.cpp
-@@ -401,6 +401,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <cfloat>
+ #include <cstring>
+ #include <filesystem>
+@@ -401,6 +402,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
    }
    dialog_loop_next_index_ = SIZE_MAX;
  
@@ -3508,6 +4556,20 @@ index 97b3131..124b627 100644
    ImGui::Render();
    ImDrawData* draw_data = ImGui::GetDrawData();
    if (draw_data) {
+@@ -419,7 +426,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   if (!dialogs_.empty()) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+-    if (presenter_) {
++    // Only for dialogs that need it: passive overlays repaint with the game's
++    // own frames.
++    const bool continuous =
++        std::any_of(dialogs_.begin(), dialogs_.end(),
++                    [](const ImGuiDialog* d) { return d->WantsContinuousRedraw(); });
++    if (presenter_ && continuous) {
+       presenter_->RequestUIPaintFromUIThread();
+     }
+   }
 diff --git a/src/ui/overlay/debug_overlay.cpp b/src/ui/overlay/debug_overlay.cpp
 index 8a97c2d..a25b510 100644
 --- a/src/ui/overlay/debug_overlay.cpp
@@ -3628,7 +4690,7 @@ index 7360ed9..1126127 100644
    PaintResult paint_result = PaintResult::kNotPresented;
    {
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 25976b4..aee54fc 100644
+index 25976b4..245ca93 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -11,10 +11,13 @@
@@ -3645,7 +4707,20 @@ index 25976b4..aee54fc 100644
  #include <rex/ui/flags.h>
  #include <rex/kernel/crt/heap.h>
  #include <rex/filesystem.h>
-@@ -239,6 +242,57 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -50,6 +53,12 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// Diagnostics for stutter reports (rex/diag_timing.h): slow frames, slow input,
++// SDL and file calls, and the vblank and present timing every 10 seconds.
++REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "GPU",
++                    "Log frame timing every 10 s and every slow frame with what it waited on "
++                    "(for stutter reports)");
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -239,6 +248,57 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      return false;
    }
  
@@ -3703,7 +4778,7 @@ index 25976b4..aee54fc 100644
    if (window_ && runtime_->input_system()) {
      static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
    }
-@@ -251,6 +305,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -251,6 +311,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
      if (input_sys) {
        input_sys->SetActiveCallback([this]() {
@@ -3721,7 +4796,7 @@ index 25976b4..aee54fc 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-@@ -304,6 +369,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -304,6 +375,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
    return true;
  }
  
@@ -3731,7 +4806,7 @@ index 25976b4..aee54fc 100644
  bool ReXApp::SetupPresentation() {
    config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
    config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
-@@ -339,9 +407,7 @@ bool ReXApp::SetupPresentation() {
+@@ -339,9 +413,7 @@ bool ReXApp::SetupPresentation() {
      return false;
    }
  
@@ -3742,7 +4817,7 @@ index 25976b4..aee54fc 100644
  
    window_->AddListener(this);
    window_->AddInputListener(this, 0);
-@@ -385,6 +451,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+@@ -385,6 +457,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
    // gated eager font upload in SetImmediateDrawer is skipped (font uploads
    // lazily on the first Draw instead).
    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
@@ -3753,7 +4828,7 @@ index 25976b4..aee54fc 100644
    rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
      if (debug_overlay_) {
        debug_overlay_.reset();
-@@ -599,9 +669,14 @@ void ReXApp::OnDestroy() {
+@@ -599,9 +675,14 @@ void ReXApp::OnDestroy() {
  
  void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
    frame_stats_provider_ = provider;

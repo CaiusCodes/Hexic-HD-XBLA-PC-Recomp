@@ -1,5 +1,8 @@
 #include "hexic_hd_init.h"
 
+// Hexic: CPU use in GPU waits (src/main.cpp). Hand edit.
+void HexicGpuWaitBackoff();
+
 DEFINE_REX_FUNC(sub_920904D8) {
 	REX_FUNC_PROLOGUE();
 	uint32_t ea{};
@@ -63229,6 +63232,7 @@ loc_920AA950:
 	if (!ctx.cr6.lt) goto loc_920AA968;
 	// li r3,1
 	ctx.r3.s64 = 1;
+	HexicGpuWaitBackoff();  // Hexic hand edit: still waiting for the GPU - yield, then sleep 0.5 ms (hexic_sleep_in_waits)
 	// b 0x920aa9d8
 	goto loc_920AA9D8;
 loc_920AA968:

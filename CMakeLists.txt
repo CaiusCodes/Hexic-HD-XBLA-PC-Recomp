@@ -24,7 +24,7 @@ endif()
 rexglue_setup_target(hexic_hd GPU_PLUGINS xenos)
 
 if(WIN32)
-    # Direct XInput polling for the PC Settings panel's controller navigation.
+    # Direct XInput polling for the Settings panel's controller navigation.
     target_link_libraries(hexic_hd PRIVATE Xinput9_1_0.lib)
 endif()
 
