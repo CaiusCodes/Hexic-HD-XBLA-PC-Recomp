@@ -8,7 +8,20 @@ Runtime and tools
 -----------------
 ReXGlue (recompilation runtime)      BSD 3-Clause, includes Xenia-derived code
                                      LICENSE-ReXGlue.txt
-Extract-STFS (package extractor)     MIT       LICENSE-Extract-STFS.txt
+  Files: resources\runtime\hexic_hd.exe, resources\runtime\rexruntime.dll,
+         resources\runtime\rexgpu-xenos.dll
+
+The launcher, "Hexic HD.exe" in the release root (setup window, package
+import and the button that starts the game):
+  STFS package reader, derived from Velocity (github.com/hetelek/Velocity)
+                                     GPL 3.0   LICENSE-Extract-STFS.txt
+  Because that reader is compiled into it, the launcher as a whole is
+  distributed under the GNU GPL version 3; its source code is in the project's
+  source repository (packaging/launcher). The game in resources\runtime is a
+  separate program and is not covered by the GPL.
+  Compressed-movie decoder (zlib/DEFLATE, RFC 1950/1951), written for this
+  project in the shape of Mark Adler's public reference decoder "puff" (zlib
+  licence, zlib.net). No zlib code or library is linked.
 
 Libraries compiled into rexruntime.dll / rexgpu-xenos.dll
 ---------------------------------------------------------
@@ -46,4 +59,4 @@ Game content
 ------------
 Hexic HD, Xbox, Xbox 360, and related names and assets belong to their
 respective rights holders. Original Hexic HD game data is not included with
-this release; it is installed from the player's own package.
+this release; it is imported from the player's own package.
