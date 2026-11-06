@@ -9,6 +9,41 @@
 REXCVAR_DEFINE_INT32(hexic_controls_version, 0, "Hexic",
                      "Keyboard defaults already applied to this config (0 = none yet)");
 
+// Menu research (test only): log every gotoAndStop/gotoAndPlay with a frame
+// label in the menus' Flash player. sub_92074078(clip, label) looks the label
+// up in the clip's label table and jumps there (sub_92089988); a button's
+// highlight is gotoAndStop("over").
+REXCVAR_DEFINE_BOOL(hexic_menu_trace, false, "Hexic", "Test-only: log menu frame-label jumps");
+
+namespace {
+uint32_t GuestU32(const uint8_t* base, uint32_t address) {
+  const uint8_t* p = base + address;
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+// A player string: [refcount][length][text]. Empty if it doesn't look like one.
+std::string GuestString(const uint8_t* base, uint32_t object) {
+  if (object < 0x40000000u || object >= 0xC0000000u) return {};
+  const uint32_t length = GuestU32(base, object + 4);
+  if (length == 0 || length > 64) return {};
+  return std::string(reinterpret_cast<const char*>(base + object + 8), length);
+}
+}  // namespace
+
+// Also how the menu mouse learns which button is highlighted (hexic_mouse.h).
+extern "C" REX_FUNC(sub_92074078) {
+  const uint32_t clip = ctx.r3.u32;
+  const uint32_t holder = ctx.r4.u32;
+  const uint32_t object = holder ? GuestU32(base, holder) : 0;
+  const std::string label = GuestString(base, object);
+  hexic_mouse::NoteLabel(clip, clip ? GuestU32(base, clip + 196) : 1, label.data(),
+                         label.size());
+  if (REXCVAR_GET(hexic_menu_trace)) {
+    REXLOG_INFO("[menu] goto clip {:08X} label \"{}\" (holder {:08X} -> {:08X})", clip, label,
+                holder, object);
+  }
+  __imp__sub_92074078(ctx, base);
+}
+
 // CPU use in GPU waits. The Xbox D3D library waits for the GPU by polling: its
 // fence waits (four of them) loop on sub_920AA8E8, which checks for a GPU hang
 // and returns 1 while still waiting. On the Xbox 360 that shared a core with
@@ -72,8 +107,10 @@ void HexicGpuWaitBackoff() {
 // per frame on the game thread. Every 10 s: game time against real time, and
 // frames whose game step disagrees with the real frame time - a frame that
 // stepped the game two frames' worth while under 20 ms of real time passed is
-// a jump forward on screen (a "double step").
+// a jump forward on screen (a "double step"). Also times the keycap overlay's
+// screen changes to the frames (hexic_mouse::NotePresent).
 void HexicNoteGameFrame(uint8_t* base) {
+  hexic_mouse::NotePresent();
   if (!rex::diag::TimingLogOn()) return;
   constexpr uint32_t kTimeStampBundleSlot = 0x9200052C;  // import variable: pointer to the bundle
   const uint32_t bundle =

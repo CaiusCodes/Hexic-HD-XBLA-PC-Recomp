@@ -16,8 +16,12 @@
 [CmdletBinding()]
 param(
     [string]$BuildPreset = "win-amd64-release",
-    [string]$Version = "0.9.0",
-    # Added to the ZIP's name: Hexic-HD-PC-<Version><Suffix>.zip
+    # The release version: the VERSION file at the repository root, which the
+    # game is built with too (Check for Updates compares against it). A
+    # different -Version is refused, so the launcher and the game agree.
+    [string]$Version = "",
+    # Added to the ZIP's name: Hexic-HD-PC-v<Version><Suffix>.zip (the name Check
+    # for Updates looks for on a GitHub release tagged v<Version>)
     [string]$Suffix = "",
     # Replace an existing ZIP of the same name (never the default: a shipped
     # release's ZIP must not be overwritten by accident).
@@ -31,6 +35,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$fileVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot "..\VERSION") -TotalCount 1).Trim()
+if (-not $Version) { $Version = $fileVersion }
+if ($Version -ne $fileVersion) {
+    throw "Version $Version differs from the VERSION file ($fileVersion): edit VERSION and rebuild the game instead."
+}
 if ($Version -notmatch '^[A-Za-z0-9._-]+$') {
     throw "Version may contain only letters, numbers, dots, underscores and hyphens."
 }
@@ -45,7 +54,8 @@ $releaseRoot = Join-Path $projectRoot "out\release"
 # Staged under out\release\staging so a copy someone plays from out\release is never touched.
 $releaseName = "Hexic HD PC"
 $stageRoot = Join-Path $releaseRoot "staging\$releaseName"
-$zipPath = Join-Path $releaseRoot "Hexic-HD-PC-$Version$Suffix.zip"
+$zipPath = Join-Path $releaseRoot "Hexic-HD-PC-v$Version$Suffix.zip"
+$shaPath = "$zipPath.sha256"
 $launcherName = "Hexic HD.exe"
 $exeName = "hexic_hd.exe"
 
@@ -237,12 +247,40 @@ if ($AssetsDir -and (Test-Path -LiteralPath $AssetsDir)) {
 }
 
 # --- 5. The release ZIP ---------------------------------------------------------
+# Entries are written one by one with forward slashes: under Windows PowerShell
+# 5.1, ZipFile.CreateFromDirectory stores backslashes ("Hexic HD PC\README.txt"),
+# which the ZIP format does not allow and some unzip tools turn into single
+# files with backslashes in their names instead of folders.
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zipPath,
-    [System.IO.Compression.CompressionLevel]::Optimal, $true)
+if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath }  # -Force was checked above
+$stageParent = Split-Path -Parent $stageRoot
+$archive = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($item in @(Get-Item -LiteralPath $stageRoot) + @(Get-ChildItem -LiteralPath $stageRoot -Recurse)) {
+        $name = $item.FullName.Substring($stageParent.Length + 1).Replace('\', '/')
+        if ($item.PSIsContainer) {
+            # Only empty folders need an entry of their own.
+            if (-not (Get-ChildItem -LiteralPath $item.FullName -Force | Select-Object -First 1)) {
+                [void]$archive.CreateEntry("$name/")
+            }
+        } else {
+            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $item.FullName, $name,
+                [System.IO.Compression.CompressionLevel]::Optimal)
+        }
+    }
+}
+finally {
+    $archive.Dispose()
+}
 
 $releaseSize = ($stagedFiles | Measure-Object -Property Length -Sum).Sum
 $zip = Get-Item -LiteralPath $zipPath
+# <zip>.sha256 beside it ("<hash>  <name>", as sha256sum writes): upload it with
+# the ZIP. Check for Updates uses GitHub's own asset digest, and this file when
+# GitHub reports none; players can check their download with it too.
+$zipSha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+[System.IO.File]::WriteAllText($shaPath, "$zipSha  $(Split-Path -Leaf $zipPath)`n")
 Write-Host "Portable release created."
 Write-Host "Folder:   $stageRoot"
 Write-Host "ZIP:      $zipPath"
@@ -252,4 +290,4 @@ Write-Host "GPU ABI:  $gpuPluginAbi"
 Write-Host "VC++ CRT: $VcRedistDir"
 Write-Host "Audit:    root holds only the 4 expected items; no forbidden items; $assetComparisons same-size game files compared, none identical"
 Write-Host ("Size:     {0:N2} MB uncompressed; {1:N2} MB ZIP" -f ($releaseSize / 1MB), ($zip.Length / 1MB))
-Write-Host "SHA256:   $((Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash)"
+Write-Host "SHA256:   $zipSha  ($shaPath)"

@@ -218,10 +218,22 @@ index 942450b..4f848f8 100644
                                 bool blocking) override;
  
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index b05df6a..99bf41c 100644
+index b05df6a..4639c9fd 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
-@@ -96,6 +96,11 @@ class SharedMemory {
+@@ -80,6 +80,11 @@ class SharedMemory {
+   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+   bool RequestRange(uint32_t start, uint32_t length);
+ 
++  // Whether every page of the range still holds its last upload (no CPU write
++  // has invalidated it since). Takes the global lock: callers that also
++  // register a watch should hold it across both, so no write slips between.
++  bool IsRangeValid(uint32_t start, uint32_t length);
++
+   // Marks the range and, if not exact_range, potentially its surroundings
+   // (to up to the first GPU-written page, as an access violation exception
+   // count optimization) as modified by the CPU, also invalidating GPU-written
+@@ -96,6 +101,11 @@ class SharedMemory {
    // regions in those pages.
    void RangeWrittenByGpu(uint32_t start, uint32_t length);
  
@@ -233,7 +245,7 @@ index b05df6a..99bf41c 100644
   protected:
    SharedMemory(memory::Memory& memory);
    // Call in implementation-specific initialization.
-@@ -176,6 +181,16 @@ class SharedMemory {
+@@ -176,6 +186,16 @@ class SharedMemory {
    // persistently allocated vector).
    std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
  
@@ -250,8 +262,24 @@ index b05df6a..99bf41c 100644
    // GPU-written memory downloading for traces. <Start address, length>.
    std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
    uint32_t trace_download_page_count_ = 0;
+diff --git a/include/rex/input/input_driver.h b/include/rex/input/input_driver.h
+index b579ef4..f94078a 100644
+--- a/include/rex/input/input_driver.h
++++ b/include/rex/input/input_driver.h
+@@ -40,6 +40,11 @@ class InputDriver {
+ 
+   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+ 
++  // A game controller, as opposed to the keyboard / mouse or the stand-in
++  // (nop) driver. InputSystem reports controllers' activity to the title
++  // (SetControllerActivityCallback), e.g. to show matching button prompts.
++  virtual bool IsController() const { return true; }
++
+   void set_is_active_callback(std::function<bool()> is_active_callback) {
+     is_active_callback_ = is_active_callback;
+   }
 diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
-index 8f34d97..b8a445d 100644
+index 8f34d97..70c5d61 100644
 --- a/include/rex/input/input_system.h
 +++ b/include/rex/input/input_system.h
 @@ -10,6 +10,7 @@
@@ -262,7 +290,7 @@ index 8f34d97..b8a445d 100644
  #include <memory>
  #include <vector>
  
-@@ -37,6 +38,14 @@ class InputSystem : public system::IInputSystem {
+@@ -37,6 +38,31 @@ class InputSystem : public system::IInputSystem {
    void AttachWindow(rex::ui::Window* window);
    void SetActiveCallback(std::function<bool()> callback);
  
@@ -274,22 +302,41 @@ index 8f34d97..b8a445d 100644
 +  // bitmask exactly - this is a no-op for any title that doesn't call it.
 +  void SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback);
 +
++  // Like the button filter, but also sees the left stick, so a title can add
++  // stick input of its own (Hexic's mouse alternates D-pad and stick presses
++  // so its menus move one step every frame). Runs after the button filter.
++  using PadFilter = std::function<void(uint16_t& buttons, int16_t& thumb_lx, int16_t& thumb_ly)>;
++  void SetPadFilterCallback(PadFilter callback);
++
++  // Called on every GetState with what the controller drivers (not the
++  // keyboard / mouse) reported for that user: connected (one answered) and
++  // active (a button, a trigger, or a stick past its dead zone). Lets a title
++  // show prompts for the device in use and follow plugging / unplugging.
++  using ControllerActivity =
++      std::function<void(uint32_t user_index, bool connected, bool active)>;
++  void SetControllerActivityCallback(ControllerActivity callback);
++
++  // Whether any controller driver has a controller for any user.
++  bool AnyControllerConnected();
++
    X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
    X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
    X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
-@@ -46,6 +55,7 @@ class InputSystem : public system::IInputSystem {
+@@ -46,6 +72,9 @@ class InputSystem : public system::IInputSystem {
    rex::ui::Window* window_ = nullptr;
  
    std::vector<std::unique_ptr<InputDriver>> drivers_;
 +  std::function<uint16_t(uint16_t buttons)> button_filter_callback_;
++  PadFilter pad_filter_callback_;
++  ControllerActivity controller_activity_callback_;
  };
  
  /// Create a default InputSystem with SDL + NOP drivers.
 diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
-index d4188df..603093a 100644
+index d4188df..f4cfb43 100644
 --- a/include/rex/input/mnk/mnk_input_driver.h
 +++ b/include/rex/input/mnk/mnk_input_driver.h
-@@ -30,6 +30,22 @@ class MnkInputDriver final : public InputDriver,
+@@ -30,9 +30,26 @@ class MnkInputDriver final : public InputDriver,
  
    X_STATUS Setup() override;
  
@@ -312,7 +359,11 @@ index d4188df..603093a 100644
    X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                             X_INPUT_CAPABILITIES* out_caps) override;
    X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
-@@ -45,6 +61,7 @@ class MnkInputDriver final : public InputDriver,
++  bool IsController() const override { return false; }
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
+   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
+                         X_INPUT_KEYSTROKE* out_keystroke) override;
+@@ -45,6 +62,7 @@ class MnkInputDriver final : public InputDriver,
    void OnMouseDown(rex::ui::MouseEvent& e) override;
    void OnMouseUp(rex::ui::MouseEvent& e) override;
    void OnMouseMove(rex::ui::MouseEvent& e) override;
@@ -320,7 +371,7 @@ index d4188df..603093a 100644
  
    // WindowListener
    void OnClosing(rex::ui::UIEvent& e) override;
-@@ -58,18 +75,36 @@ class MnkInputDriver final : public InputDriver,
+@@ -58,18 +76,36 @@ class MnkInputDriver final : public InputDriver,
    void UpdateMouseCapture();
    void SetKeyState(uint16_t vk, bool down);
    void EnqueueKeystroke(uint16_t vk_pad, bool down);
@@ -357,6 +408,18 @@ index d4188df..603093a 100644
    // Cursor visibility to restore on capture release - the window owner may run
    // an auto-hide policy that capture must not permanently override.
    rex::ui::Window::CursorVisibility precapture_cursor_visibility_ =
+diff --git a/include/rex/input/nop/nop_input_driver.h b/include/rex/input/nop/nop_input_driver.h
+index c3e46cf..c825e1f 100644
+--- a/include/rex/input/nop/nop_input_driver.h
++++ b/include/rex/input/nop/nop_input_driver.h
+@@ -24,6 +24,7 @@ class NopInputDriver final : public InputDriver {
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
+                            X_INPUT_CAPABILITIES* out_caps) override;
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
++  bool IsController() const override { return false; }
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
+   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
+                         X_INPUT_KEYSTROKE* out_keystroke) override;
 diff --git a/include/rex/kernel/xam/local_leaderboards.h b/include/rex/kernel/xam/local_leaderboards.h
 new file mode 100644
 index 0000000..87bf22e
@@ -789,10 +852,24 @@ index e15e410..b9f236b 100644
 +
  }  // namespace rex::ui
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..7efb4be 100644
+index afb4a30..ba6bfdb 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
-@@ -13,6 +13,7 @@
+@@ -1,4 +1,13 @@
+ #pragma once
++
++// CAS and FSR 1 (the presenter's guest output effects) use prebuilt shaders
++// and need nothing from the FidelityFX SDK, so they are always built (as in
++// the GoldenEye port); defining this here keeps every module that includes
++// this header in step. FSR 2/3 still need the SDK runtime
++// (REX_HAS_FIDELITYFX_RUNTIME), which this build does not have.
++#ifndef REX_HAS_FIDELITYFX_SDK
++#define REX_HAS_FIDELITYFX_SDK 1
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -13,6 +22,7 @@
  #include <algorithm>
  #include <array>
  #include <atomic>
@@ -800,7 +877,17 @@ index afb4a30..7efb4be 100644
  #include <climits>
  #include <cmath>
  #include <condition_variable>
-@@ -977,6 +978,10 @@ class Presenter {
+@@ -367,6 +377,9 @@ class Presenter {
+   }
+   // For simplicity, may be called repeatedly even if no changes have been made.
+   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
++  // Re-reads present_effect and its sharpness options (UI thread), so an
++  // upscaling setting applies without a restart.
++  void ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
+ 
+   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
+   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
+@@ -977,6 +990,10 @@ class Presenter {
    // rather than being blank.
    bool guest_output_active_last_refresh_ = false;
  
@@ -883,6 +970,36 @@ index 5d8476f..adf9724 100644
    // Called by SDLWindowedAppContext on the UI thread.
    void HandleWindowEvent(SDL_Event& event);
    void HandleKeyEvent(SDL_Event& event);
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index fe62017..d13db67 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -195,10 +195,21 @@ void AudioSystem::Shutdown() {
+   worker_running_ = false;
+   shutdown_event_->Set();
+   if (worker_thread_) {
+-    // The worker may be stuck inside a guest callback that is itself blocked
+-    // on guest objects (e.g. KeWaitForMultipleObjects).
+-    // Terminate the thread to break the deadlock.
+-    worker_thread_->Terminate(0);
++    // Let the worker leave on its own first: it wakes on shutdown_event_, or
++    // within 500 ms from its idle sleep. Terminating it straight away could
++    // kill it while it was already exiting, inside the loader's thread-detach
++    // callbacks with the loader lock held: every later thread exit then waits
++    // on that lock forever, and closing the SDL audio device below (which
++    // joins SDL's audio thread) hung the quit with the process left running
++    // (Hexic HD: after a render-scale change, every time). Only a worker
++    // still stuck inside a guest callback that is blocked on guest objects
++    // (e.g. KeWaitForMultipleObjects) is terminated.
++    rex::thread::Thread* host_thread = worker_thread_->thread();
++    if (!host_thread || rex::thread::Wait(host_thread, false, std::chrono::milliseconds(1500)) !=
++                            rex::thread::WaitResult::kSuccess) {
++      REXAPU_WARN("AudioSystem::Shutdown: worker did not exit; terminating it");
++      worker_thread_->Terminate(0);
++    }
+     worker_thread_.reset();
+   }
+ 
 diff --git a/src/core/clock.cpp b/src/core/clock.cpp
 index ae72b7a..ab7923d 100644
 --- a/src/core/clock.cpp
@@ -1897,7 +2014,7 @@ index efed1b7..e30d8f2 100644
    sample_counts->Total_B = 0;
    sample_counts->ZPass_A = clamped;
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 3877b1a..bc40309 100644
+index 3877b1a..616c664 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -13,6 +13,7 @@
@@ -1963,7 +2080,7 @@ index 3877b1a..bc40309 100644
  X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
    if (presenter_) {
      return X_STATUS_SUCCESS;
-@@ -162,16 +190,100 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -162,16 +190,110 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
          uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
          uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
@@ -2000,6 +2117,16 @@ index 3877b1a..bc40309 100644
              MarkVblank();
              last_frame_time += interval_ticks;
 +            fired = true;
++          }
++          if (fired && command_processor_) {
++            // Live anti-aliasing (as in the GoldenEye port): re-apply
++            // swap_post_effect so a Settings change takes effect without a
++            // restart. SetDesiredSwapPostEffect returns early when unchanged.
++            // Read through GetFlagByName, which copies the string under the
++            // cvar registry lock: the UI thread may be assigning it right now
++            // (SetFlagByName), and REXCVAR_GET would read it unlocked.
++            command_processor_->SetDesiredSwapPostEffect(
++                ParseSwapPostEffect(rex::cvar::GetFlagByName("swap_post_effect")));
 +          }
 +          if (fired && rex::diag::TimingLogOn()) {
 +            if (prev_fire) {
@@ -2067,7 +2194,7 @@ index 3877b1a..bc40309 100644
          return 0;
        }));
    // TODO: set_can_debugger_suspend not yet ported
-@@ -348,6 +460,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
+@@ -348,6 +470,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
    command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
  }
  
@@ -2090,8 +2217,64 @@ index 3877b1a..bc40309 100644
  void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                               uint32_t title_id, bool blocking) {
    if (!REXCVAR_GET(store_shaders)) {
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index c7c824e..58c308f 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -685,19 +685,43 @@ TextureCache::Texture::~Texture() {
+ void TextureCache::Texture::MakeUpToDateAndWatch(
+     const std::unique_lock<std::recursive_mutex>& global_lock) {
+   SharedMemory& shared_memory = texture_cache().shared_memory();
++  // A CPU write between this texture's upload (RequestRanges) and here has
++  // invalidated its pages, firing no watch (none was registered yet) and
++  // removing their write protection, so no later write would fire one either:
++  // the texture would keep stale data until it is recreated (Hexic HD's glyph
++  // cache texture lost newly drawn letters this way). Such a range stays
++  // outdated instead, and the next draw reloads it. The caller holds the
++  // global lock, so no write can land between the check and the watch.
++  bool stale = false;
+   if (base_outdated_) {
+     assert_not_zero(GetGuestBaseSize());
+-    base_outdated_ = false;
+-    base_watch_handle_ = shared_memory.WatchMemoryRange(
+-        key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
++    if (!shared_memory.IsRangeValid(key().base_page << 12, GetGuestBaseSize())) {
++      stale = true;
++    } else {
++      base_outdated_ = false;
++      base_watch_handle_ = shared_memory.WatchMemoryRange(
++          key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
++      outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
++    }
+   }
+   if (mips_outdated_) {
+     assert_not_zero(GetGuestMipsSize());
+-    mips_outdated_ = false;
+-    mips_watch_handle_ = shared_memory.WatchMemoryRange(
+-        key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
+-    outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
++    if (!shared_memory.IsRangeValid(key().mip_page << 12, GetGuestMipsSize())) {
++      stale = true;
++    } else {
++      mips_outdated_ = false;
++      mips_watch_handle_ = shared_memory.WatchMemoryRange(
++          key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
++      outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
++    }
++  }
++  if (stale) {
++    texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
++    static std::atomic<uint32_t> logged{0};
++    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
++      REXGPU_INFO("Texture at {:08X} was written by the CPU while it loaded; reloading",
++                  key().base_page << 12);
++    }
+   }
+ }
+ 
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index 333becb..e22b5c3 100644
+index 333becb..b76526f 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -16,6 +16,7 @@
@@ -2116,7 +2299,7 @@ index 333becb..e22b5c3 100644
    // Mark the range as valid (so pages are not reuploaded until modified by the
    // CPU) and watch it so the CPU can reuse it and this will be caught.
    MakeRangeValid(start, length, true);
-@@ -570,9 +578,72 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -570,9 +578,100 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
      return true;
    }
  
@@ -2186,11 +2369,53 @@ index 333becb..e22b5c3 100644
 +  std::fill(std::begin(upload_stats_by_mb_), std::end(upload_stats_by_mb_), uint64_t(0));
 +}
 +
++bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) {
++  if (length == 0 || start >= kBufferSize) {
++    return true;
++  }
++  length = std::min(length, kBufferSize - start);
++  uint32_t page_first = start >> page_size_log2_;
++  uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  uint32_t block_last = page_last >> 6;
++  auto global_lock = global_critical_region_.Acquire();
++  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
++  if (!valid_flags) {
++    return true;
++  }
++  for (uint32_t i = page_first >> 6; i <= block_last; ++i) {
++    uint64_t block_valid = valid_flags[i];
++    if (i == (page_first >> 6)) {
++      block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
++    }
++    if (i == block_last && (page_last & 63) != 63) {
++      block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
++    }
++    if (block_valid != UINT64_MAX) {
++      return false;
++    }
++  }
++  return true;
++}
++
  bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
    std::pair<uint32_t, uint32_t> range(start, length);
    return RequestRanges(&range, 1);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index a40436e..7fee1ce 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -5478,6 +5478,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+   }
+ 
+   if (is_closing_frame) {
++    if (shared_memory_) {
++      shared_memory_->NoteFrameForUploadStats();
++    }
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+     }
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
-index e132acb..3c94f5a 100644
+index e132acb..6cf23e7 100644
 --- a/src/input/input_system.cpp
 +++ b/src/input/input_system.cpp
 @@ -13,6 +13,7 @@
@@ -2201,12 +2426,31 @@ index e132acb..3c94f5a 100644
  #include <rex/input/flags.h>
  #include <rex/input/input_driver.h>
  #include <rex/input/input_system.h>
-@@ -57,9 +58,14 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+@@ -57,9 +58,33 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
    }
  }
  
 +void InputSystem::SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback) {
 +  button_filter_callback_ = std::move(callback);
++}
++
++void InputSystem::SetPadFilterCallback(PadFilter callback) {
++  pad_filter_callback_ = std::move(callback);
++}
++
++void InputSystem::SetControllerActivityCallback(ControllerActivity callback) {
++  controller_activity_callback_ = std::move(callback);
++}
++
++bool InputSystem::AnyControllerConnected() {
++  for (auto& driver : drivers_) {
++    if (!driver->IsController()) continue;
++    for (uint32_t user = 0; user < 4; ++user) {
++      X_INPUT_CAPABILITIES caps = {};
++      if (driver->GetCapabilities(user, 0, &caps) == X_ERROR_SUCCESS) return true;
++    }
++  }
++  return false;
 +}
 +
  X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
@@ -2216,7 +2460,7 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    for (auto& driver : drivers_) {
-@@ -76,6 +82,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+@@ -76,10 +101,12 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
  
  X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
    SCOPE_profile_cpu_f("hid");
@@ -2224,18 +2468,56 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    bool first_result = true;
-@@ -120,6 +127,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   X_INPUT_STATE merged = {};
++  bool controller_connected = false, controller_active = false;
+ 
+   for (auto& driver : drivers_) {
+     X_INPUT_STATE state = {};
+@@ -87,6 +114,16 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+       any_connected = true;
+     }
++    if (result == X_ERROR_SUCCESS && driver->IsController()) {
++      controller_connected = true;
++      const auto& pad = state.gamepad;
++      auto past_dead_zone = [](int16_t axis) { return std::abs(int(axis)) > 12000; };
++      if (uint16_t(pad.buttons) != 0 || pad.left_trigger > 64 || pad.right_trigger > 64 ||
++          past_dead_zone(pad.thumb_lx) || past_dead_zone(pad.thumb_ly) ||
++          past_dead_zone(pad.thumb_rx) || past_dead_zone(pad.thumb_ry)) {
++        controller_active = true;
++      }
++    }
+     if (result == X_ERROR_SUCCESS) {
+       if (first_result) {
+         merged = state;
+@@ -116,10 +153,26 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     }
+   }
+ 
++  if (controller_activity_callback_) {
++    controller_activity_callback_(user_index, controller_connected, controller_active);
++  }
++
+   if (first_result) {
      return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
 +  if (button_filter_callback_) {
 +    merged.gamepad.buttons = button_filter_callback_(merged.gamepad.buttons);
 +  }
++  if (pad_filter_callback_) {
++    uint16_t buttons = merged.gamepad.buttons;
++    int16_t lx = merged.gamepad.thumb_lx, ly = merged.gamepad.thumb_ly;
++    pad_filter_callback_(buttons, lx, ly);
++    merged.gamepad.buttons = buttons;
++    merged.gamepad.thumb_lx = lx;
++    merged.gamepad.thumb_ly = ly;
++  }
 +
    if (out_state) {
      *out_state = merged;
    }
-@@ -128,6 +139,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+@@ -128,6 +181,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
  
  X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
    SCOPE_profile_cpu_f("hid");
@@ -2243,7 +2525,7 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    for (auto& driver : drivers_) {
-@@ -145,18 +157,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+@@ -145,18 +199,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
  X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                     X_INPUT_KEYSTROKE* out_keystroke) {
    SCOPE_profile_cpu_f("hid");
@@ -4640,7 +4922,7 @@ index 8a97c2d..a25b510 100644
 +
  }  // namespace rex::ui
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..1126127 100644
+index 7360ed9..52788bd 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -29,6 +29,10 @@
@@ -4689,8 +4971,19 @@ index 7360ed9..1126127 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
+@@ -649,6 +681,10 @@ bool Presenter::RefreshGuestOutput(
+   return is_active;
+ }
+ 
++void Presenter::ReloadGuestOutputPaintConfigFromCVarsFromUIThread() {
++  SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
++}
++
+ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
+   // For simplicity, this may be called externally repeatedly.
+   // Lock the mutex only when something has been modified, and also don't
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 25976b4..245ca93 100644
+index 25976b4..8a3d49c 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -11,10 +11,13 @@
@@ -4707,20 +5000,102 @@ index 25976b4..245ca93 100644
  #include <rex/ui/flags.h>
  #include <rex/kernel/crt/heap.h>
  #include <rex/filesystem.h>
-@@ -50,6 +53,12 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+@@ -43,13 +46,94 @@
+ 
+ #include <algorithm>
+ #include <filesystem>
++#include <string>
+ #include <string_view>
+ 
++#if REX_PLATFORM_WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <dxgi.h>
++#endif
++
+ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                        "GPU emulation")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
++// Render backend, ported from the Perfect Dark / GoldenEye SDKs. "auto" uses
++// Direct3D 12 on NVIDIA and Vulkan on every other GPU: D3D12 with the Xenos
++// plugin crashes on AMD in GoldenEye, as it does in Xenia. Read once at start.
++REXCVAR_DEFINE_STRING(gpu, "auto", "GPU",
++                      "Render backend: auto (NVIDIA -> d3d12, other GPUs -> vulkan), d3d12 or vulkan")
++    .allowed({"auto", "d3d12", "vulkan"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
 +// Diagnostics for stutter reports (rex/diag_timing.h): slow frames, slow input,
 +// SDL and file calls, and the vblank and present timing every 10 seconds.
 +REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "GPU",
 +                    "Log frame timing every 10 s and every slow frame with what it waited on "
 +                    "(for stutter reports)");
 +
++namespace {
++// PCI vendor id of the first hardware GPU, 0 if unknown. DXGI is loaded at run
++// time so nothing links against it here.
++uint32_t PrimaryGpuVendorId() {
++#if REX_PLATFORM_WIN32
++  // Test aid: REX_TEST_GPU_VENDOR=1002 (hex) makes auto act as on that vendor's GPU.
++  if (const char* forced = std::getenv("REX_TEST_GPU_VENDOR")) {
++    return uint32_t(std::strtoul(forced, nullptr, 16));
++  }
++  HMODULE dxgi = ::LoadLibraryW(L"dxgi.dll");
++  if (!dxgi) return 0u;
++  using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
++  auto create_factory1 =
++      reinterpret_cast<CreateFactory1Fn>(::GetProcAddress(dxgi, "CreateDXGIFactory1"));
++  uint32_t vendor = 0u;
++  IDXGIFactory1* factory = nullptr;
++  if (create_factory1 && SUCCEEDED(create_factory1(IID_PPV_ARGS(&factory))) && factory) {
++    IDXGIAdapter1* adapter = nullptr;
++    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
++      DXGI_ADAPTER_DESC1 desc;
++      const bool hardware =
++          SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
++      adapter->Release();
++      adapter = nullptr;
++      if (hardware) {
++        vendor = desc.VendorId;  // the first hardware adapter is the one used
++        break;
++      }
++    }
++    factory->Release();
++  }
++  ::FreeLibrary(dxgi);
++  return vendor;
++#else
++  return 0u;
++#endif
++}
++
++std::string ResolveGpuBackend() {
++  const std::string choice = REXCVAR_GET(gpu);
++  if (choice == "d3d12" || choice == "vulkan") {
++    REXLOG_INFO("gpu = {}", choice);
++    return choice;
++  }
++  const uint32_t vendor = PrimaryGpuVendorId();
++#if REX_HAS_VULKAN
++  const std::string backend = vendor == 0x10DEu ? "d3d12" : "vulkan";
++#else
++  const std::string backend = "d3d12";
++#endif
++  REXLOG_INFO("gpu = auto: GPU vendor {:04X} -> {}", vendor, backend);
++  return backend;
++}
++}  // namespace
++
  namespace rex {
  
  // --- ReXApp ---
-@@ -239,6 +248,57 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -239,6 +323,57 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      return false;
    }
  
@@ -4778,7 +5153,7 @@ index 25976b4..245ca93 100644
    if (window_ && runtime_->input_system()) {
      static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
    }
-@@ -251,6 +311,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -251,6 +386,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
      if (input_sys) {
        input_sys->SetActiveCallback([this]() {
@@ -4796,7 +5171,7 @@ index 25976b4..245ca93 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-@@ -304,6 +375,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -304,6 +450,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
    return true;
  }
  
@@ -4806,7 +5181,50 @@ index 25976b4..245ca93 100644
  bool ReXApp::SetupPresentation() {
    config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
    config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
-@@ -339,9 +413,7 @@ bool ReXApp::SetupPresentation() {
+@@ -312,8 +461,20 @@ bool ReXApp::SetupPresentation() {
+ 
+   OnPreSetup(config_);
+ 
++  // The backend this plugin was asked for; empty when the app supplied its own
++  // graphics system or the plugin's default was taken.
++  std::string backend;
+   if (!config_.graphics && !config_.gpu_plugin.empty()) {
+-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
++    backend = ResolveGpuBackend();
++    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, backend);
++    if (!config_.graphics) {
++      // The backend asked for is not in this plugin: take whatever it has
++      // rather than not starting.
++      REXLOG_WARN("gpu = {}: not available in this build; using the plugin's default backend",
++                  backend);
++      backend.clear();
++      config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, "any");
++    }
+     if (!config_.graphics) {
+       // Fatal by design: no silent headless fallback.
+       auto msg =
+@@ -326,7 +487,19 @@ bool ReXApp::SetupPresentation() {
+ 
+   if (config_.graphics) {
+     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
+-    if (XFAILED(status)) {
++    if (XFAILED(status) && !backend.empty()) {
++      // No Vulkan driver, or a GPU without what one backend needs: try the
++      // other backend before giving up.
++      const std::string other = backend == "vulkan" ? "d3d12" : "vulkan";
++      REXLOG_WARN("Graphics presentation setup failed ({:08X}) on {}; trying {}", status, backend,
++                  other);
++      config_.graphics.reset();
++      config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, other);
++      if (config_.graphics) {
++        status = config_.graphics->SetupPresentation(&app_context());
++      }
++    }
++    if (!config_.graphics || XFAILED(status)) {
+       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
+       return false;
+     }
+@@ -339,9 +512,7 @@ bool ReXApp::SetupPresentation() {
      return false;
    }
  
@@ -4817,7 +5235,7 @@ index 25976b4..245ca93 100644
  
    window_->AddListener(this);
    window_->AddInputListener(this, 0);
-@@ -385,6 +457,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+@@ -385,6 +556,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
    // gated eager font upload in SetImmediateDrawer is skipped (font uploads
    // lazily on the first Draw instead).
    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
@@ -4828,7 +5246,7 @@ index 25976b4..245ca93 100644
    rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
      if (debug_overlay_) {
        debug_overlay_.reset();
-@@ -599,9 +675,14 @@ void ReXApp::OnDestroy() {
+@@ -599,9 +774,14 @@ void ReXApp::OnDestroy() {
  
  void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
    frame_stats_provider_ = provider;
@@ -4843,6 +5261,34 @@ index 25976b4..245ca93 100644
  }
  
  }  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 30bafba..dc24ac6 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1347,9 +1347,20 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   // interfering with GPU command processing, and also to allow tearing so
+   // variable refresh rate may be used where it's available.
+   // Note: If the priorities here are changes, update the cvar descriptions.
+-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+-      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+-          present_modes.cend()) {
++  //
++  // V-Sync on uses mailbox (the newest frame at the next refresh: no tearing,
++  // and presenting never blocks), or FIFO where mailbox is missing. V-Sync off
++  // keeps the immediate (tearing) mode below. Read when the swapchain is made,
++  // so a change applies on the next resize or restart.
++  if (rex::cvar::GetFlagByName("vsync") != "false") {
++    swapchain_create_info.presentMode =
++        std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
++                present_modes.cend()
++            ? VK_PRESENT_MODE_MAILBOX_KHR
++            : VK_PRESENT_MODE_FIFO_KHR;
++  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
++             std::find(present_modes.cbegin(), present_modes.cend(),
++                       VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
+     // Allowing tearing to reduce latency, and possibly variable refresh rate
+     // (though on Windows with borderless fullscreen, GDI copying is used
+     // instead of independent flip, so it's not supported there).
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 index c37e550..ab57949 100644
 --- a/src/ui/window_sdl.cpp

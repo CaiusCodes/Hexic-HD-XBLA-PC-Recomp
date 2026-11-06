@@ -1,0 +1,4 @@
+// Windows resources for hexic_hd.exe. SDL uses the first icon in the exe for
+// the window, so this one shows on the title bar and the taskbar.
+// The icon is original artwork drawn by packaging/Make-Icon.ps1.
+1 ICON "../packaging/hexic_hd.ico"

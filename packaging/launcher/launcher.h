@@ -132,6 +132,7 @@ struct SetupOptions {
   fs::path shortcut_folder;  // where the desktop shortcut goes (--shortcut-folder, testing)
   std::wstring game_args;    // passed to the game on Play
   bool forced = false;       // --setup on a complete install
+  bool update = false;       // --update: the update mode (RunUpdate), then the game again
   std::wstring reason;       // why setup opened (a missing file), for the log
 };
 int RunSetupWindow(HINSTANCE instance, const Paths& p, const SetupOptions& options);
@@ -151,5 +152,24 @@ std::vector<std::wstring> PatchPcMenus(const fs::path& assets);
 
 // Inflates a zlib stream (a compressed SWF body). False on any error.
 bool Inflate(const uint8_t* zlib_data, size_t size, std::vector<uint8_t>* out);
+// Inflates a raw deflate stream (a ZIP entry); `expected` sizes the output.
+bool InflateRaw(const uint8_t* data, size_t size, size_t expected, std::vector<uint8_t>* out);
+
+// --------------------------------------------------------------- update --
+// "Hexic HD.exe --update" (update.cpp; the game's Settings > Updates opens it):
+// asks GitHub for the latest release (src/hexic_update.h), downloads its ZIP
+// into resources\.update, checks its SHA-256, unpacks it and replaces the
+// program files (Hexic HD.exe, README.txt, licenses\, resources\runtime\ but
+// not its logs). resources\assets and resources\userdata are never touched.
+struct UpdateOutcome {
+  enum Kind { kUpdated, kUpToDate, kFailed, kCancelled } kind = kFailed;
+  std::wstring version;  // the latest release's version, when known
+  std::wstring message;  // why it failed, for the player
+};
+UpdateOutcome RunUpdate(const Paths& p, const std::atomic<bool>& cancel, const Report& report);
+// Puts back program files from an update cut off half-way, deletes leftovers
+// (the previous launcher's exe, which cannot be deleted while it runs) and the
+// download folder. Safe to call any time; cheap when there is nothing to do.
+void RecoverInterruptedUpdate(const Paths& p);
 
 }  // namespace hexic

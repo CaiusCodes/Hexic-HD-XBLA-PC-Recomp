@@ -162,10 +162,11 @@ inline void Log() {
   for (const auto& line : DisplayLines()) REXLOG_INFO("[system] {}", line);
   auto flag = [](const char* name) { return rex::cvar::GetFlagByName(name); };
   REXLOG_INFO("[system] settings: fullscreen {}, vsync {}, fixed guest vblank {}, frame limit {}, "
-              "resolution {} x {}, render scale {}x",
+              "resolution {} x {}, render scale {}x, anti-aliasing {}, upscaling {}, renderer {}",
               flag("fullscreen"), flag("vsync"), flag("fixed_guest_vblank"),
               flag("present_frame_limit"), flag("video_mode_width"), flag("video_mode_height"),
-              flag("resolution_scale"));
+              flag("resolution_scale"), flag("swap_post_effect"), flag("present_effect"),
+              flag("gpu"));
 }
 
 }  // namespace hexic_system_info

@@ -7,11 +7,11 @@
 # regenerated from the ReXGlue template. Its content is quoted in CLAUDE.md.
 /CMakeUserPresets.json
 
-# Built by packaging/Build-Launcher.ps1 and Make-Icon.ps1 during a release
+# Built by packaging/Build-Launcher.ps1 during a release
 # (legacy-setup/Build-Stubs.ps1 also writes the old Setup there).
+# packaging/hexic_hd.ico is tracked: the game's own build embeds it.
 /packaging/Install Hexic HD.exe
 /packaging/Hexic HD.exe
-/packaging/hexic_hd.ico
 
 # Game data from an Xbox 360 package must never be committed.
 *.xex

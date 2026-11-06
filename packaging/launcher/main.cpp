@@ -4,6 +4,11 @@
 //                                     game data has not been imported (or a
 //                                     needed file is missing)
 //   Hexic HD.exe --setup              open the setup window
+//   Hexic HD.exe --update             download and install the latest release
+//                                     (the game's Settings > Updates starts this
+//                                     and closes itself), then start the game
+//                                     (update.cpp; HEXIC_UPDATE_API points it at
+//                                     another releases URL, for testing)
 //
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut]
@@ -63,13 +68,15 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  bool setup = false, unattended = false;
+  bool setup = false, unattended = false, update = false;
   std::wstring extras;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
     if (arg == L"--setup") {
       setup = true;
+    } else if (arg == L"--update") {
+      update = true;
     } else if (arg == L"--unattended") {
       unattended = true;
     } else if (arg == L"--package" && i + 1 < argc) {
@@ -91,11 +98,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   // folders. This is one directory check when nothing was cut off.
   LogTo(p.logs);
   RecoverInterruptedSwap(p);
+  // The same for an update cut off half-way (and the previous launcher's exe,
+  // left behind by an update because it was running).
+  RecoverInterruptedUpdate(p);
 
   // The normal case: everything is in place, so start the game at once.
   std::wstring missing;
   const bool installed = IsInstalled(p, &missing);
-  if (installed && !setup && options.package.empty()) {
+  if (installed && !setup && !update && options.package.empty()) {
     if (GetFileAttributesW(p.config.c_str()) == INVALID_FILE_ATTRIBUTES) {
       LogTo(p.logs);
       EnsureSettings(p);
@@ -130,7 +140,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
   LogTo(p.logs);
   options.forced = installed;
-  options.reason = installed ? L"--setup" : L"missing " + missing;
+  options.update = update && installed;  // an incomplete install needs setup first
+  options.reason = options.update ? L"--update" : installed ? L"--setup" : L"missing " + missing;
   const int code = unattended ? RunUnattended(p, options, extras) : RunSetupWindow(instance, p, options);
   if (mutex) {
     ReleaseMutex(mutex);

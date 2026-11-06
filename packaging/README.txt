@@ -20,7 +20,7 @@ that it is the supported version and imports the game data from it into this
 folder. After that the package is not needed any more.
 
 Requirements:
-  Windows 10 or 11 (64-bit) and a DirectX 12 capable graphics card.
+  Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan.
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
 
@@ -48,23 +48,62 @@ rights are needed. It does not download anything and does not contact
 Xbox LIVE.
 
 SETTINGS
------------
+--------
 
-The main menu's Achievements entry is now Settings:
-  Player Name          the name shown on High Scores and the new-high-score
-                       screen (up to 15 characters; leave it empty to use
-                       your Windows user name)
-  Display Mode         Windowed or Fullscreen
-  Resolution           Window size, 1280 x 720 up to 3840 x 2160
-  Render Scale         1x (default), 2x or 3x: renders the picture at 2 or
-                       3 times the detail in each direction. Sharper on
-                       large windows, but more work for the graphics card
+The main menu's Achievements entry is now Settings. Its categories run down
+the left: switch with LB / RB, Q / E, or a click. Up / Down picks a setting,
+Left / Right changes it (or click a choice), A / Enter opens a page, and
+B / Esc or a right click closes. Categories: Display, Graphics, Player,
+Controls and Updates.
+
+Display
+  Display mode         Windowed or Fullscreen
+  Window size          1280 x 720, 1920 x 1080, 2560 x 1440 or 3840 x 2160
   VSync                The game always runs at 60 fps. On: no tearing.
                        Off: frames reach the screen sooner, may tear
-  Show FPS
-  Keyboard Controls    change the keys (see CONTROLS)
-Changes apply immediately. Xbox Dashboard is now Quit Hexic.
+  Show FPS             Frame rate in the top corner
+Graphics
+  Render scale         1x (default), 2x or 3x: renders the picture at 2 or
+                       3 times the detail in each direction. Sharper on
+                       large windows, but more work for the graphics card
+  Anti-aliasing        Off (default), FXAA or Extreme: smooths edges on the
+                       finished picture (slightly softens text)
+  Upscaling            Off (default) or FSR: AMD FidelityFX Super Resolution
+                       1 sharpens the picture when the window is larger than
+                       1280 x 720. Very cheap
+  Renderer             Auto (default), D3D12 or Vulkan. Auto uses Direct3D
+                       12 on NVIDIA cards and Vulkan on AMD and Intel.
+                       Applies the next time you start the game. If the
+                       chosen one cannot start, the game uses the other one
+Player
+  Player name          Shown on High Scores and the new-high-score screen
+                       (up to 15 characters). The game picks a fun name for
+                       you the first time; leave it empty to get another
+Controls
+  Keyboard controls    Change the keys (see CONTROLS)
+Updates
+  Check for Updates    Shows your version. Press it to ask GitHub whether a
+                       newer release of this port exists (see UPDATES)
 
+Changes apply immediately, except Renderer, and VSync when the renderer is
+Vulkan (both apply after a restart). Xbox Dashboard is now Quit Hexic, and
+the game's own Options screen (sound, piece pattern, credits) is now Game
+Options.
+
+UPDATES
+-------
+
+Settings > Updates > Check for Updates asks GitHub for this port's latest
+release. Nothing is ever checked in the background or at start, only when you
+press it, and nothing is sent but that request. If a newer version exists, it
+says which and offers Update (from the main menu only; mid-game it asks you to
+quit to the main menu first). Update closes the game and opens the Hexic HD
+window, which downloads the release ZIP, checks it against the SHA-256 that
+GitHub publishes for it, and replaces the program files: Hexic HD.exe,
+README.txt, licenses\ and resources\runtime\. Your imported game data
+(resources\assets) and your saves, high scores and settings
+(resources\userdata) are never touched. If anything goes wrong, every file is
+put back as it was and the game is left unchanged. Then the game starts again.
 HIGH SCORES
 -----------
 
@@ -81,12 +120,12 @@ CONTROLS
 Keyboard and an Xbox controller both work, at the same time. Each key stands
 in for a controller input. The defaults:
   Move                        Arrow keys (D-pad) or W A S D (left stick)
-  Rotate clockwise, select    Space or Enter (A)
-  Rotate counter-clockwise    Q (X)
+  Rotate clockwise, select    E, Space or Enter (A); left click in a game
+  Rotate counter-clockwise    Q (X); right click in a game
   Rotate with the triggers    Z (left trigger) / X (right trigger)
   Back                        Backspace (B)
   Pause                       Esc (Start)
-  Y, bumpers, Back button     E, 1 / 3, Tab
+  Bumpers, Back button        1 / 3, Tab
   Right stick                 I J K L, stick clicks C / V
 
 To change them, open Settings > Keyboard Controls. Every controller input
@@ -99,7 +138,17 @@ input uses swaps them, so nothing is left without a key. Mouse buttons can be
 bound too.
 
 The Settings panels use the arrow keys, Enter and Esc, or the D-pad, A and
-B.
+B, or the mouse.
+
+The game's menus work with the mouse too: point at a button to highlight it,
+left click to choose it, right click to go back. On Game Options, click the
+arrows to change a setting. In a game, point at the board to move the
+cursor; left click rotates the three pieces clockwise, right click
+counter-clockwise.
+
+On the title screen any key, or a click in the game window, continues. With
+no controller connected when the game starts, the title screen says "Press
+any key to continue."
 
 PORTABLE DATA
 -------------
@@ -152,6 +201,10 @@ Extract the ZIP first. Do not run Hexic HD.exe from inside the ZIP.
 
 Hexic HD.exe is not digitally signed, so the first time you open it Windows
 may show "Windows protected your PC". Choose More info, then Run anyway.
+
+If the picture is wrong, black or the game closes on start, try the other
+renderer: Settings > Renderer, or the line gpu = "vulkan" (or "d3d12") in
+resources\userdata\hexic_hd.toml.
 
 If the game stutters, add the line
   vblank_timing_log = true

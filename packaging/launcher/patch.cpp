@@ -93,7 +93,9 @@ std::wstring PatchGxml(const fs::path& assets) {
   };
   static const Replacement kReplacements[] = {
       {">Achievements</text>", ">Settings</text>"},
-      {"Show off the awards you've earned.", "Change display, audio and performance settings."},
+      // More wording (Options -> Game Options, ...) is applied by the game as it
+      // starts (src/hexic_title.h), so installs imported earlier get it too.
+      {"Show off the awards you've earned.", "Change display, graphics and keyboard settings."},
       {">Xbox Dashboard</text>", ">Quit Hexic</text>"},
       {"Quit Hexic, and return to the Xbox Dashboard.", "Quit Hexic, and return to the desktop."},
       // Leaderboards -> High Scores: the screen lists this PC's scores only.

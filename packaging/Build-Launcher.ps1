@@ -5,11 +5,15 @@
 # CRT (it needs nothing installed to start), no packing, no embedded payload,
 # no scripts. It carries the default hexic_hd.toml as a resource, plus the game
 # icon and version information.
+#
+# The version comes from the VERSION file at the repository root (the game
+# reads the same file when it is built); -Version overrides it, for test builds.
 [CmdletBinding()]
-param([string]$Version = '0.9.0')
+param([string]$Version = '')
 
 $ErrorActionPreference = 'Stop'
 $packaging = $PSScriptRoot
+if (-not $Version) { $Version = (Get-Content -LiteralPath (Join-Path $packaging '..\VERSION') -TotalCount 1).Trim() }
 if ($Version -notmatch '^[0-9][0-9A-Za-z.-]*$') { throw "Unexpected version text: $Version" }
 $llvm = 'C:\Program Files\LLVM\bin'
 $clang = Join-Path $llvm 'clang-cl.exe'
@@ -102,7 +106,7 @@ END
     $sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter *.cpp | ForEach-Object FullName)
     & $clang /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DNOMINMAX "/DHEXIC_VERSION=$Version" `
         "/I$sourceDir" "/Fo$work\" @sources "/Fe$output" /link /SUBSYSTEM:WINDOWS `
-        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib bcrypt.lib $resPath
+        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib bcrypt.lib winhttp.lib $resPath
     if ($LASTEXITCODE -ne 0) { throw 'clang-cl failed for the launcher' }
     Write-Host ('Built {0} ({1:N0} bytes)' -f (Split-Path -Leaf $output), (Get-Item -LiteralPath $output).Length)
 }

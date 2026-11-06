@@ -17,37 +17,59 @@ function Mix($A, $B, [double]$T) {
         [int]($ca.R + ($cb.R - $ca.R) * $T), [int]($ca.G + ($cb.G - $ca.G) * $T), [int]($ca.B + ($cb.B - $ca.B) * $T))
 }
 
-# Pointy-top hexagon.
-function New-HexPath([double]$Cx, [double]$Cy, [double]$R) {
-    $points = New-Object 'System.Drawing.PointF[]' 6
+function Alpha([int]$A, [string]$Hex) { $c = Color $Hex; return [System.Drawing.Color]::FromArgb($A, $c.R, $c.G, $c.B) }
+
+# Pointy-top hexagon; $Round > 0 softens each corner with a short curve.
+function New-HexPath([double]$Cx, [double]$Cy, [double]$R, [double]$Round = 0) {
+    $pts = @()
     for ($i = 0; $i -lt 6; $i++) {
         $a = [Math]::PI / 180 * (60 * $i - 90)
-        $points[$i] = New-Object System.Drawing.PointF(($Cx + $R * [Math]::Cos($a)), ($Cy + $R * [Math]::Sin($a)))
+        $pts += , @(($Cx + $R * [Math]::Cos($a)), ($Cy + $R * [Math]::Sin($a)))
     }
     $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $path.AddPolygon($points)
+    if ($Round -le 0) {
+        $points = New-Object 'System.Drawing.PointF[]' 6
+        for ($i = 0; $i -lt 6; $i++) { $points[$i] = New-Object System.Drawing.PointF($pts[$i][0], $pts[$i][1]) }
+        $path.AddPolygon($points)
+        return , $path
+    }
+    $t = [Math]::Min(0.45, $Round)
+    for ($i = 0; $i -lt 6; $i++) {
+        $p = $pts[$i]; $prev = $pts[($i + 5) % 6]; $next = $pts[($i + 1) % 6]
+        $ax = $p[0] + ($prev[0] - $p[0]) * $t; $ay = $p[1] + ($prev[1] - $p[1]) * $t
+        $bx = $p[0] + ($next[0] - $p[0]) * $t; $by = $p[1] + ($next[1] - $p[1]) * $t
+        if ($i -gt 0) { $path.AddLine($lastX, $lastY, $ax, $ay) } else { $firstX = $ax; $firstY = $ay }
+        $path.AddBezier($ax, $ay, $p[0], $p[1], $p[0], $p[1], $bx, $by)
+        $lastX = $bx; $lastY = $by
+    }
+    $path.AddLine($lastX, $lastY, $firstX, $firstY)
+    $path.CloseFigure()
     return , $path
 }
 
+# A cut gem: vertical shading, a lighter inner facet, a gloss on top, dark rim.
 function Paint-Jewel($g, [double]$Cx, [double]$Cy, [double]$R, [string]$Hex) {
-    $path = New-HexPath $Cx $Cy $R
+    $path = New-HexPath $Cx $Cy $R 0.12
     $rect = New-Object System.Drawing.RectangleF(($Cx - $R), ($Cy - $R - 1), ($R * 2), ($R * 2 + 2))
-    $fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, (Mix $Hex '#FFFFFF' 0.5), (Mix $Hex '#000000' 0.45), [single]90)
+    $fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, (Color $Hex), (Color $Hex), [single]90)
     $blend = New-Object System.Drawing.Drawing2D.ColorBlend(3)
-    $blend.Colors = [System.Drawing.Color[]]@((Mix $Hex '#FFFFFF' 0.5), (Color $Hex), (Mix $Hex '#000000' 0.45))
+    $blend.Colors = [System.Drawing.Color[]]@((Mix $Hex '#FFFFFF' 0.55), (Color $Hex), (Mix $Hex '#000000' 0.5))
     $blend.Positions = [single[]]@(0, 0.5, 1)
     $fill.InterpolationColors = $blend
     $g.FillPath($fill, $path)
 
-    $gloss = New-HexPath $Cx ($Cy - $R * 0.3) ($R * 0.6)
+    $facet = New-HexPath $Cx $Cy ($R * 0.62) 0.12
+    $facetBrush = New-Object System.Drawing.SolidBrush((Alpha 60 '#FFFFFF'))
+    $g.FillPath($facetBrush, $facet)
+
+    $gloss = New-HexPath $Cx ($Cy - $R * 0.32) ($R * 0.55) 0.3
     $glossRect = New-Object System.Drawing.RectangleF(($Cx - $R), ($Cy - $R), ($R * 2), ($R * 1.1))
-    $shine = New-Object System.Drawing.Drawing2D.LinearGradientBrush($glossRect,
-        [System.Drawing.Color]::FromArgb(170, 255, 255, 255), [System.Drawing.Color]::FromArgb(0, 255, 255, 255), [single]90)
+    $shine = New-Object System.Drawing.Drawing2D.LinearGradientBrush($glossRect, (Alpha 200 '#FFFFFF'), (Alpha 0 '#FFFFFF'), [single]90)
     $g.FillPath($shine, $gloss)
 
-    $pen = New-Object System.Drawing.Pen((Mix $Hex '#000000' 0.6), [single][Math]::Max(0.8, $R / 9))
+    $pen = New-Object System.Drawing.Pen((Mix $Hex '#000000' 0.65), [single][Math]::Max(0.7, $R / 10))
     $g.DrawPath($pen, $path)
-    foreach ($o in @($pen, $shine, $gloss, $fill, $path)) { $o.Dispose() }
+    foreach ($o in @($pen, $shine, $gloss, $facetBrush, $facet, $fill, $path)) { $o.Dispose() }
 }
 
 function New-IconPng([int]$Size) {

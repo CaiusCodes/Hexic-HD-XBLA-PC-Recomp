@@ -4,6 +4,10 @@
 
 #pragma once
 
+// Before <xinput.h>: it #defines XINPUT_DEVTYPE_GAMEPAD, a name the SDK's
+// input headers declare as an enum value.
+#include <rex/input/input_system.h>
+
 #include <windows.h>
 #include <xinput.h>
 
@@ -19,7 +23,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string_view>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -35,10 +41,18 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_sdl.h>
 
+#include "hexic_input.h"
+#include "hexic_input_mode.h"
+#include "hexic_mouse.h"
+#include "hexic_player_names.h"
 #include "hexic_system_info.h"
+#include "hexic_title.h"
+#include "hexic_update.h"
+#include "hexic_version.h"  // HEXIC_VERSION, generated from VERSION (CMakeLists.txt)
 
 // Which set of Hexic keyboard defaults this config has received (main.cpp).
 REXCVAR_DECLARE(int32_t, hexic_controls_version);
@@ -236,10 +250,10 @@ struct Binding {
 
 inline const std::vector<Binding>& Bindings() {
   static const std::vector<Binding> kBindings = {
-      {"A", "Rotate clockwise, select", "keybind_a", "Space,Return"},
+      {"A", "Rotate clockwise, select", "keybind_a", "E,Space,Return"},
       {"B", "Back", "keybind_b", "Backspace"},
       {"X", "Rotate counter-clockwise", "keybind_x", "Q"},
-      {"Y", "", "keybind_y", "E"},
+      {"Y", "", "keybind_y", ""},
       {"Left Trigger", "Rotate", "keybind_left_trigger", "Z"},
       {"Right Trigger", "Rotate", "keybind_right_trigger", "X"},
       {"Left Bumper", "", "keybind_left_shoulder", "1"},
@@ -264,9 +278,10 @@ inline const std::vector<Binding>& Bindings() {
   return kBindings;
 }
 
-// Bumped whenever the defaults above change, so existing configs pick them up.
-constexpr int32_t kDefaultsVersion = 1;
-constexpr size_t kMaxKeysPerBinding = 2;
+// Bumped whenever the defaults above change, so existing configs pick them up
+// (version 2: E rotates clockwise like Space, Y has no key; see Upgrade).
+constexpr int32_t kDefaultsVersion = 2;
+constexpr size_t kMaxKeysPerBinding = 3;
 
 inline std::vector<std::string> SplitKeys(const std::string& value) {
   std::vector<std::string> keys;
@@ -367,71 +382,26 @@ inline void ApplyDefaults() {
   rex::cvar::SetFlagByName("keybind_guide", "");
 }
 
+// Brings a config made with older defaults up to date without undoing the
+// player's own changes: version 1 -> 2 moves E from Y to A (E and Q are
+// rotate clockwise / counterclockwise), only if E is still where 1 put it.
+inline void Upgrade(int32_t from_version) {
+  if (from_version < 1) {
+    ApplyDefaults();
+    return;
+  }
+  if (from_version < 2 && rex::cvar::GetFlagByName("keybind_y") == "E") {
+    rex::cvar::SetFlagByName("keybind_y", "");
+    auto keys = SplitKeys(rex::cvar::GetFlagByName("keybind_a"));
+    if (std::find(keys.begin(), keys.end(), "E") == keys.end() && keys.size() < kMaxKeysPerBinding) {
+      keys.insert(keys.begin(), "E");
+      rex::cvar::SetFlagByName("keybind_a", JoinKeys(keys));
+    }
+    REXLOG_INFO("[controls] E now rotates clockwise (A): {}", rex::cvar::GetFlagByName("keybind_a"));
+  }
+}
+
 }  // namespace hexic_controls
-
-// A native, controller-first PC settings panel, shown in place of Hexic
-// HD's own (Xbox-only) Achievements viewer: the main menu's "Achievements"
-// button now opens this instead of the unavailable Xbox system UI. Reuses
-// the same CVars as the F4 debug overlay, so both stay in sync.
-//
-// Navigation is a fixed-order row list (matching the game's own Options
-// screen), driven directly by XInput and the keyboard rather than ImGui's
-// mouse-oriented widgets: Up/Down moves the selection, Left/Right/A cycles
-// a row's value, B (or Escape) always closes.
-class HexicSettingsDialog : public rex::ui::ImGuiDialog {
- public:
-  // `select_row` lets a sub-dialog return with its own row still highlighted.
-  HexicSettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer, HexicHdApp* app, int select_row = 0);
-
-  void OnDraw(ImGuiIO& io) override;
-
-  enum Row : int {
-    kRowPlayerName = 0,
-    kRowFullscreen,
-    kRowResolution,
-    kRowRenderScale,
-    kRowVSync,
-    kRowShowFps,
-    kRowControls,
-    kRowDone,
-    kRowCount,
-  };
-
- protected:
-  void OnClose() override;
-
- private:
-
-  struct InputEdges {
-    bool up = false;
-    bool down = false;
-    bool left = false;
-    bool right = false;
-    bool confirm = false;
-    bool back = false;
-  };
-
-  InputEdges PollInput();
-  void MoveSelection(int delta);
-  void CycleRow(int row, int delta);
-  void ActivateRow(int row);
-  void DrawRow(ImDrawList* draw_list, ImVec2 pos, ImVec2 size, int row, bool selected,
-              const char* label, const char* value, bool has_value, bool show_chevrons = true);
-
-  HexicHdApp* app_;
-  bool has_opened_shown_ = false;
-  int selected_row_ = kRowPlayerName;
-
-  // Edge-detection state for keyboard and controller polling.
-  bool key_was_down_[6] = {};
-  WORD pad_buttons_prev_ = 0;
-  bool pad_was_connected_ = false;
-  // The first PollInput() call only seeds key_was_down_/pad_buttons_prev_
-  // and reports no edges: the button that opened this dialog (e.g. A on the
-  // main menu) is often still physically held on that first polled frame,
-  // and without priming it would read as a fresh edge here too.
-  bool input_primed_ = false;
-};
 
 // Menu input for the Hexic dialogs: arrow keys / D-pad / left stick to move,
 // Enter / A to confirm, Esc / B to go back, Tab / Y for a second action and
@@ -442,7 +412,11 @@ class HexicSettingsDialog : public rex::ui::ImGuiDialog {
 // the press that opened a dialog can't also act inside it.
 class HexicMenuInput {
  public:
-  enum Action : int { kUp, kDown, kLeft, kRight, kConfirm, kBack, kAlt, kReset, kCount };
+  enum Action : int {
+    kUp, kDown, kLeft, kRight, kConfirm, kBack, kAlt, kReset,
+    kPrevPage, kNextPage,  // Q / E, Page Up / Page Down, LB / RB
+    kCount
+  };
 
   explicit HexicMenuInput(bool repeat_reset = false) : repeat_reset_(repeat_reset) {}
 
@@ -458,10 +432,21 @@ class HexicMenuInput {
       held[kBack] = key(VK_ESCAPE);
       held[kAlt] = key(VK_TAB);
       held[kReset] = key(VK_BACK) || key(VK_DELETE);
+      held[kPrevPage] = key('Q') || key(VK_PRIOR);
+      held[kNextPage] = key('E') || key(VK_NEXT);
+      // The game gets no input while a dialog is open, so the dialog itself
+      // tells the button prompts which device is in use (hexic_input_mode.h).
+      for (int i = 0; i < kCount; ++i) {
+        if (held[i]) hexic_input_mode::NoteKeyboardMouse();
+      }
       XINPUT_STATE state{};
       if (XInputGetState(0, &state) == ERROR_SUCCESS) {
         const WORD b = state.Gamepad.wButtons;
         constexpr SHORT kStick = 16000;
+        if (b != 0 || std::abs(state.Gamepad.sThumbLX) > kStick ||
+            std::abs(state.Gamepad.sThumbLY) > kStick) {
+          hexic_input_mode::SetMode(hexic_input_mode::kController, "controller used in a dialog");
+        }
         held[kUp] |= (b & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > kStick;
         held[kDown] |= (b & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -kStick;
         held[kLeft] |= (b & XINPUT_GAMEPAD_DPAD_LEFT) || state.Gamepad.sThumbLX < -kStick;
@@ -470,6 +455,8 @@ class HexicMenuInput {
         held[kBack] |= (b & XINPUT_GAMEPAD_B) != 0;
         held[kAlt] |= (b & XINPUT_GAMEPAD_Y) != 0;
         held[kReset] |= (b & XINPUT_GAMEPAD_X) != 0;
+        held[kPrevPage] |= (b & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+        held[kNextPage] |= (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
       }
     }
     const auto now = std::chrono::steady_clock::now();
@@ -498,6 +485,69 @@ class HexicMenuInput {
   std::chrono::steady_clock::time_point repeat_at_[kCount] = {};
 };
 
+// The PC settings panel, shown in place of Hexic HD's own (Xbox-only)
+// Achievements viewer. Categories down the side (Display, Graphics, Player,
+// Controls); the chosen category's settings on the right, every choice shown
+// with the current one filled in. Reuses the same CVars as the F4 overlay.
+//
+// Controller: LB / RB category, D-pad up / down setting, left / right choice,
+// A opens (Player name, Keyboard controls), B closes. Keyboard: Q / E (or
+// Page Up / Down), arrows, Enter, Esc. Mouse: click a category or a choice;
+// right click closes.
+class HexicSettingsDialog : public rex::ui::ImGuiDialog {
+ public:
+  // Every setting, by category. kRowPlayerName and kRowControls are the
+  // pages a sub-dialog returns to.
+  enum Item : int {
+    kItemDisplayMode,
+    kItemResolution,
+    kItemVSync,
+    kItemShowFps,
+    kItemRenderScale,
+    kItemAntiAliasing,
+    kItemUpscaling,
+    kItemRenderer,
+    kRowPlayerName,
+    kRowControls,
+    kRowUpdates,
+    kItemCount,
+  };
+
+  // `select_item` lets a sub-dialog return with its own setting selected.
+  HexicSettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer, HexicHdApp* app,
+                      int select_item = kItemDisplayMode);
+
+  void OnDraw(ImGuiIO& io) override;
+
+ protected:
+  void OnClose() override;
+
+ private:
+  enum Category : int { kDisplay, kGraphics, kPlayer, kControls, kUpdates, kCategoryCount };
+
+  static Category CategoryOf(int item);
+  static int FirstItem(Category category);
+  static int ItemCount(Category category);
+
+  // The choices of a setting with fixed options, and which is current; an
+  // empty list means the item opens a page instead (Player name, Controls).
+  static std::vector<const char*> Options(int item);
+  static int Current(int item);
+  static void Choose(int item, int option);
+  static const char* Label(int item);
+  static std::string Help(int item);
+
+  void SelectCategory(Category category);
+  void Activate(int item);
+
+  HexicHdApp* app_;
+  HexicMenuInput input_;
+  bool has_opened_shown_ = false;
+  Category category_ = kDisplay;
+  int item_ = kItemDisplayMode;
+  ImVec2 last_mouse_{-1.0f, -1.0f};
+};
+
 // Settings > Player Name: the name Hexic shows as your gamertag (High
 // Scores, the new-high-score screen). Typed characters come from ImGui's
 // input queue; empty means the Windows user name, as before.
@@ -517,6 +567,43 @@ class HexicNameEntryDialog : public rex::ui::ImGuiDialog {
   HexicMenuInput input_{true};
   std::string text_;
   bool has_opened_shown_ = false;
+  std::chrono::steady_clock::time_point opened_at_{};
+};
+
+// What Check for Updates found (HexicHdApp::StartUpdateCheck). Outside the
+// app class: a nested type with default member initializers can't be used in
+// the class's own static members.
+enum class HexicUpdateState { kIdle, kChecking, kUpToDate, kAvailable, kFailed, kNoLauncher };
+struct HexicUpdateStatus {
+  HexicUpdateState state = HexicUpdateState::kIdle;
+  std::string latest, error;
+  uint64_t size = 0;
+};
+
+// Settings > Updates > Check for Updates: a small box (the PC dialogs' card)
+// while a worker asks GitHub for the latest release (HexicHdApp::
+// StartUpdateCheck, src/hexic_update.h), then its answer: up to date, could not
+// check (with the reason), not in a release folder, or "Version X is available.
+// You have Y." with Update / Cancel. Update starts the launcher's update
+// ("Hexic HD.exe --update") and closes the game, from the main menu only.
+// Nothing is checked unless the player opens this.
+// Keys: Left / Right (or Up / Down) choose, Enter / A press, Esc / B close;
+// mouse: hover chooses, click presses, right click closes.
+class HexicUpdateDialog : public rex::ui::ImGuiDialog {
+ public:
+  HexicUpdateDialog(rex::ui::ImGuiDrawer* imgui_drawer, HexicHdApp* app);
+  void OnDraw(ImGuiIO& io) override;
+
+ protected:
+  void OnClose() override;
+
+ private:
+  HexicHdApp* app_;
+  HexicMenuInput input_;
+  bool has_opened_shown_ = false;
+  bool updating_ = false;  // Update pressed: the game is closing
+  int selected_ = 0;
+  ImVec2 last_mouse_{-1.0f, -1.0f};
   std::chrono::steady_clock::time_point opened_at_{};
 };
 
@@ -573,6 +660,151 @@ class HexicSignInHook : public rex::ui::ImGuiDialog {
   HexicHdApp* app_;
 };
 
+// Keycaps over the game's own pad icons when no controller is connected: in
+// play the side panel's X (rotate counter-clockwise) and A (rotate clockwise)
+// icons and the Start icon by "Pause"; in menus the B icon by "Back" / "Menu"
+// and the A icon by "Next Page". The icons are vector shapes inside panels,
+// not clips of their own, so their stage positions (1280 x 720) are fixed
+// here per screen (hexic_mouse::g_screen, from the screen clip's label).
+// Each cap shows the first key bound to that button.
+class HexicKeycapOverlay : public rex::ui::ImGuiDialog {
+ public:
+  // swapped_frames: the game frames the GPU has swapped in so far.
+  HexicKeycapOverlay(rex::ui::ImGuiDrawer* imgui_drawer,
+                     std::function<uint64_t()> swapped_frames, bool trace)
+      : rex::ui::ImGuiDialog(imgui_drawer),
+        swapped_frames_(std::move(swapped_frames)),
+        trace_(trace) {}
+
+  // Passive: drawn with the game's frames, which repaint anyway.
+  bool WantsContinuousRedraw() const override { return false; }
+
+  void OnDraw(ImGuiIO& io) override {
+    const auto now = std::chrono::steady_clock::now();
+    // The screen in the picture on show, not as just set (hexic_mouse::NotePresent).
+    const uint64_t swapped = swapped_frames_ ? swapped_frames_() : 0;
+    const int screen = hexic_mouse::ScreenOnShow(swapped);
+    if (trace_ && now >= next_trace_) {
+      next_trace_ = now + std::chrono::seconds(5);
+      REXLOG_INFO("[keycaps] game presents {}, frames swapped in {}, offset {}",
+                  hexic_mouse::g_presents.load(), swapped, hexic_mouse::g_swap_offset.load());
+    }
+    if (screen == hexic_mouse::kScreenTitle) {
+      DrawVersion(io);
+      return;
+    }
+    // The game's own pad icons while a controller is the device in use
+    // (hexic_input_mode.h: the last one used, following plugging in / out).
+    if (screen == hexic_mouse::kScreenOther || hexic_input_mode::UsingController()) return;
+    // The keys bound to each button (re-read once a second, after rebinding).
+    if (now >= next_key_check_) {
+      next_key_check_ = now + std::chrono::seconds(1);
+      keys_[kKeyX] = FirstKey("keybind_x", "Q");
+      keys_[kKeyA] = FirstKey("keybind_a", "E");
+      keys_[kKeyStart] = FirstKey("keybind_start", "Esc");
+      keys_[kKeyB] = FirstKey("keybind_b", "Bksp");
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 pos = viewport ? viewport->Pos : ImVec2(0, 0);
+    const ImVec2 size = viewport ? viewport->Size : io.DisplaySize;
+    if (size.x <= 0 || size.y <= 0) return;
+    const float scale = std::min(size.x / 1280.0f, size.y / 720.0f);
+    const float ox = pos.x + (size.x - 1280.0f * scale) * 0.5f;
+    const float oy = pos.y + (size.y - 720.0f * scale) * 0.5f;
+
+    struct Cap {
+      float x, y;  // stage pixels, icon centre
+      int key;
+      int grow;    // a wide cap grows: -1 left, 0 both ways, 1 right (away from the text)
+    };
+    static constexpr Cap kPlay[] = {
+        {994, 481, kKeyX, 0}, {1015, 527, kKeyA, 0}, {983, 612, kKeyStart, 0}};
+    static constexpr Cap kBack[] = {{862, 641, kKeyB, 1}};
+    static constexpr Cap kHowTo[] = {{418, 641, kKeyA, -1}, {862, 641, kKeyB, 1}};
+    static constexpr Cap kLeaderboard[] = {{1030, 618, kKeyB, 0}};
+    const Cap* caps = nullptr;
+    size_t count = 0;
+    switch (screen) {
+      case hexic_mouse::kScreenActive: caps = kPlay; count = std::size(kPlay); break;
+      case hexic_mouse::kScreenBack: caps = kBack; count = std::size(kBack); break;
+      case hexic_mouse::kScreenHowTo: caps = kHowTo; count = std::size(kHowTo); break;
+      case hexic_mouse::kScreenLeaderboard:
+        caps = kLeaderboard;
+        count = std::size(kLeaderboard);
+        break;
+      default: return;
+    }
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    ImFont* font = HexicFonts::body ? HexicFonts::body : ImGui::GetFont();
+    for (size_t i = 0; i < count; ++i) {
+      const Cap& cap = caps[i];
+      const std::string& label = keys_[cap.key];
+      // The pad icons are ~37 px across with their outline; cover them fully.
+      const float h = 44.0f * scale;
+      const float base_size = 22.0f * scale * (label.size() > 1 ? 0.8f : 1.0f);
+      const ImVec2 text = font->CalcTextSizeA(base_size, FLT_MAX, 0, label.c_str());
+      const float w = std::max(h, text.x + 14.0f * scale);
+      const float cy = oy + cap.y * scale;
+      const float cx = ox + cap.x * scale + cap.grow * (w - h) * 0.5f;
+      const ImVec2 a(cx - w * 0.5f, cy - h * 0.5f), b(cx + w * 0.5f, cy + h * 0.5f);
+      const float r = 6.0f * scale;
+      // Key body: a darker base with a lighter top face, like a keycap.
+      dl->AddRectFilled(ImVec2(a.x, a.y + 2 * scale), ImVec2(b.x, b.y + 2 * scale),
+                        IM_COL32(20, 24, 34, 235), r);
+      dl->AddRectFilled(a, b, IM_COL32(236, 240, 246, 255), r);
+      dl->AddRectFilledMultiColor(ImVec2(a.x + 3 * scale, a.y + 3 * scale),
+                                  ImVec2(b.x - 3 * scale, cy), IM_COL32(255, 255, 255, 120),
+                                  IM_COL32(255, 255, 255, 120), IM_COL32(255, 255, 255, 0),
+                                  IM_COL32(255, 255, 255, 0));
+      dl->AddRect(a, b, IM_COL32(70, 80, 100, 255), r, 0, 1.5f * scale);
+      dl->AddText(font, base_size, ImVec2(cx - text.x * 0.5f, cy - text.y * 0.5f),
+                  IM_COL32(30, 36, 48, 255), label.c_str());
+    }
+  }
+
+ private:
+  // The title screen: the port's version, faint, in the stage's bottom-left
+  // corner (dark background there, clear of the bezel).
+  static void DrawVersion(ImGuiIO& io) {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 pos = viewport ? viewport->Pos : ImVec2(0, 0);
+    const ImVec2 size = viewport ? viewport->Size : io.DisplaySize;
+    if (size.x <= 0 || size.y <= 0) return;
+    const float scale = std::min(size.x / 1280.0f, size.y / 720.0f);
+    const float ox = pos.x + (size.x - 1280.0f * scale) * 0.5f;
+    const float oy = pos.y + (size.y - 720.0f * scale) * 0.5f;
+    ImFont* font = HexicFonts::body ? HexicFonts::body : ImGui::GetFont();
+    const float font_size = 17.0f * scale;
+    const std::string text = std::string("v") + HEXIC_VERSION;
+    const ImVec2 extent = font->CalcTextSizeA(font_size, FLT_MAX, 0, text.c_str());
+    ImGui::GetBackgroundDrawList()->AddText(font, font_size,
+                                            ImVec2(ox + 18.0f * scale, oy + (720.0f - 16.0f) * scale - extent.y),
+                                            IM_COL32(0xDC, 0xD8, 0xF2, 90), text.c_str());
+  }
+
+  // First key of a binding, as printed on a key.
+  static std::string FirstKey(const char* cvar, const char* fallback) {
+    std::string keys = rex::cvar::GetFlagByName(cvar);
+    std::string key = keys.substr(0, keys.find(','));
+    while (!key.empty() && key.front() == ' ') key.erase(key.begin());
+    while (!key.empty() && key.back() == ' ') key.pop_back();
+    if (key.empty()) return fallback;
+    if (key == "Escape") return "Esc";
+    if (key == "Return") return "Enter";
+    if (key == "Space") return "Space";
+    if (key == "Backspace") return "Bksp";
+    return key;
+  }
+
+  enum { kKeyX, kKeyA, kKeyStart, kKeyB, kKeyCount };
+  std::function<uint64_t()> swapped_frames_;
+  bool trace_ = false;
+  std::chrono::steady_clock::time_point next_trace_{};
+  std::chrono::steady_clock::time_point next_key_check_{};
+  std::string keys_[kKeyCount] = {"Q", "E", "Esc", "Bksp"};
+};
+
 class HexicHdApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -618,7 +850,14 @@ class HexicHdApp : public rex::ReXApp {
     paths.config_path = hexic_paths::ConfigPath();
   }
 
-  std::string GetWindowTitle() const override { return "Hexic HD PC"; }
+  std::string GetWindowTitle() const override { return "Hexic HD"; }
+
+  // Game frames the GPU has swapped in (for the keycaps' frame timing).
+  static uint64_t SwappedFrames() {
+    HexicHdApp* app = current_instance_;
+    auto* graphics = app && app->runtime() ? app->runtime()->graphics_system() : nullptr;
+    return graphics ? graphics->guest_frame_count() : 0;
+  }
 
   // window() is a protected ReXApp accessor; the settings dialog isn't part
   // of this class hierarchy so it needs a public way to check focus before
@@ -652,6 +891,10 @@ class HexicHdApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     imgui_drawer_ = drawer;
     imgui_drawer_->AddDialog(new HexicSignInHook(imgui_drawer_, this));
+    hexic_mouse::g_swap_counter.store(&HexicHdApp::SwappedFrames, std::memory_order_release);
+    imgui_drawer_->AddDialog(new HexicKeycapOverlay(
+        imgui_drawer_, &HexicHdApp::SwappedFrames,
+        rex::cvar::GetFlagByName("hexic_menu_trace") == "true"));
     rex::kernel::xam::SetShowAchievementsUICallback([this]() {
       // The guest can call XamShowAchievementsUI more than once per press
       // (e.g. while input is held/repeating); only one settings dialog
@@ -669,7 +912,7 @@ class HexicHdApp : public rex::ReXApp {
       auto now = std::chrono::steady_clock::now();
       bool in_cooldown = now - last_dialog_closed_time_ < std::chrono::milliseconds(400);
       if (modal_depth_ == 0 && !in_cooldown) {
-        OpenSettings(HexicSettingsDialog::kRowPlayerName);
+        OpenSettings(HexicSettingsDialog::kItemDisplayMode);
       }
     });
 
@@ -686,18 +929,106 @@ class HexicHdApp : public rex::ReXApp {
     // with V-Sync off the 1000 Hz guest vblank (~220 fps) sped them up; with
     // a fixed vblank V-Sync only decides whether frames may tear.
     rex::cvar::SetFlagByName("fixed_guest_vblank", "true");
+    startup_renderer_ = GetPcRenderer();
+    ApplyWindowIcons();
     hexic_system_info::Log();
     rex::cvar::SetFlagByName("mnk_mode", "true");
     rex::cvar::SetFlagByName("mnk_mouse", "false");
     rex::cvar::SetFlagByName("mnk_dpad_to_stick", "false");
+    // The title prompt suits the input present now, plus later PC wording;
+    // the game reads g.xml after this, as it starts.
+    auto* input_system =
+        runtime() ? static_cast<rex::input::InputSystem*>(runtime()->input_system()) : nullptr;
+    const bool controller_at_start = hexic_title::ControllerConnected() ||
+                                     (input_system && input_system->AnyControllerConnected());
+    hexic_title::ApplyMenuText(hexic_paths::DataRoot() / "assets", controller_at_start);
+    // Button prompts follow the device in use (hexic_input_mode.h).
+    hexic_input_mode::g_mode.store(controller_at_start ? hexic_input_mode::kController
+                                                       : hexic_input_mode::kKeyboardMouse);
+    if (input_system) {
+      input_system->SetControllerActivityCallback(&hexic_input_mode::NoteController);
+    }
+    // Extra pad input on every poll the game makes: test presses, and any key
+    // or click as A on the title screen (hexic_input.h, hexic_title.h).
+    // Test input SETTING=name,value (hexic_input.h): a Settings change, on the
+    // UI thread like the dialog's.
+    hexic_input::TestPresses::g_setting_hook = [this](std::string name, std::string value) {
+      // The update box: SETTING=open_updates,1 opens it as Settings would;
+      // SETTING=dialog,down|up|press|back drives it (its keys are real input).
+      if (name == "dialog") {
+        if (value == "down") ++test_dialog_moves_;
+        if (value == "up") --test_dialog_moves_;
+        if (value == "press") test_dialog_press_ = true;
+        if (value == "back") test_dialog_back_ = true;
+        return;
+      }
+      app_context().CallInUIThread([this, name, value]() {
+        if (name == "open_updates") OpenUpdateDialog();
+        if (name == "open_settings") OpenSettings(std::atoi(value.c_str()));  // the row to select
+        const int number = std::atoi(value.c_str());
+        if (name == "render_scale") SetPcRenderScale(number);
+        if (name == "fsr") SetPcFsr(number != 0);
+        if (name == "aa") SetPcAntiAliasing(number);
+        if (name == "vsync") SetPcVSync(number != 0);
+        if (name == "show_fps") SetPcShowFps(number != 0);
+      });
+    };
+    menu_mouse_.SetWindow(game_window_);
+    if (window()) window()->AddInputListener(&title_input_, 0);
+    menu_mouse_.SetTrace(rex::cvar::GetFlagByName("hexic_menu_trace") == "true");
+    if (runtime() && runtime()->input_system()) {
+      static_cast<rex::input::InputSystem*>(runtime()->input_system())
+          ->SetPadFilterCallback([this](uint16_t& buttons, int16_t& lx, int16_t& ly) {
+            const bool title = OnTitleScreen();
+            buttons |= test_presses_.Poll() | any_key_starts_.Poll(title);
+            if (!title) {
+              menu_mouse_.Poll(runtime() ? runtime()->memory() : nullptr, buttons, lx, ly,
+                               MouseBelongsToDialog());
+            }
+          });
+    }
+    // No saved name (a new install, or one left empty): pick one from the list
+    // rather than showing the Windows account name, and keep it.
+    if (SavedPlayerName().empty()) {
+      rex::cvar::SetFlagByName("net_player_name", hexic_player_names::Random());
+      SavePcSettings();
+      REXLOG_INFO("[name] assigned the player name \"{}\"", SavedPlayerName());
+    }
     if (REXCVAR_GET(hexic_controls_version) < hexic_controls::kDefaultsVersion) {
-      hexic_controls::ApplyDefaults();
+      hexic_controls::Upgrade(REXCVAR_GET(hexic_controls_version));
       REXCVAR_SET(hexic_controls_version, hexic_controls::kDefaultsVersion);
       SavePcSettings();
-      REXLOG_INFO("[controls] applied Hexic keyboard defaults (version {})",
-                  hexic_controls::kDefaultsVersion);
+      REXLOG_INFO("[controls] keyboard defaults now version {}", hexic_controls::kDefaultsVersion);
     }
   }
+
+  // The game window's key and mouse input: on the title screen any key or
+  // mouse button counts (hexic_title.h), and any of it (or a real mouse move)
+  // switches the button prompts to the keyboard and mouse (hexic_input_mode.h).
+  // Alt and the Windows keys come with switching windows, so they don't count.
+  class TitleInputListener : public rex::ui::WindowInputListener {
+   public:
+    explicit TitleInputListener(hexic_title::AnyKeyStarts* target) : target_(target) {}
+    void OnKeyDown(rex::ui::KeyEvent& e) override {
+      using rex::ui::VirtualKey;
+      const VirtualKey key = e.virtual_key();
+      if (key != VirtualKey::kMenu && key != VirtualKey::kLMenu && key != VirtualKey::kRMenu &&
+          key != VirtualKey::kLWin && key != VirtualKey::kRWin && e.repeat_count() == 0) {
+        target_->NotePress();
+        hexic_input_mode::NoteKeyboardMouse();
+      }
+    }
+    void OnMouseDown(rex::ui::MouseEvent&) override {
+      target_->NotePress();
+      hexic_input_mode::NoteKeyboardMouse();
+    }
+    void OnMouseMove(rex::ui::MouseEvent& e) override { moves_.Note(e.x(), e.y()); }
+    void OnMouseWheel(rex::ui::MouseEvent&) override { hexic_input_mode::NoteKeyboardMouse(); }
+
+   private:
+    hexic_title::AnyKeyStarts* target_;
+    hexic_input_mode::MouseMoves moves_;
+  };
 
   // --- the PC dialogs --------------------------------------------------------
   // While any of them is open the game must not act on the keys used in it, so
@@ -706,13 +1037,27 @@ class HexicHdApp : public rex::ReXApp {
   // closing itself, so the count never drops to zero in between.
   void BeginModal() {
     if (modal_depth_++ == 0) rex::cvar::SetFlagByName("mnk_mode", "false");
+    modal_open_.store(true, std::memory_order_release);
   }
 
   void EndModal() {
     if (modal_depth_ > 0 && --modal_depth_ == 0) {
       rex::cvar::SetFlagByName("mnk_mode", "true");
       last_dialog_closed_time_ = std::chrono::steady_clock::now();
+      modal_closed_at_.store(last_dialog_closed_time_.time_since_epoch().count(),
+                             std::memory_order_relaxed);
+      modal_open_.store(false, std::memory_order_release);
     }
+  }
+
+  // Game thread: whether the game's menus must leave the mouse alone - a PC
+  // dialog is open, or closed under 150 ms ago (the click that closed it can
+  // still be down at the next pad poll).
+  bool MouseBelongsToDialog() const {
+    if (modal_open_.load(std::memory_order_acquire)) return true;
+    const auto closed = std::chrono::steady_clock::time_point(
+        std::chrono::steady_clock::duration(modal_closed_at_.load(std::memory_order_relaxed)));
+    return std::chrono::steady_clock::now() - closed < std::chrono::milliseconds(150);
   }
 
   void OpenSettings(int select_row) {
@@ -729,6 +1074,109 @@ class HexicHdApp : public rex::ReXApp {
     if (imgui_drawer_) imgui_drawer_->AddDialog(new HexicControlsDialog(imgui_drawer_, this));
   }
 
+  // ---- Settings > Updates > Check for Updates ------------------------------
+  // Only when the player asks (ported from Perfect Dark's): the box asks
+  // GitHub for the latest release on a worker thread. Update starts the
+  // launcher with --update and closes the game, from the main menu only; the
+  // launcher downloads, verifies and installs the release, then starts the
+  // game again.
+  using UpdateState = HexicUpdateState;
+  using UpdateStatus = HexicUpdateStatus;
+  static inline std::mutex update_mutex_;
+  static inline UpdateStatus update_status_;
+  static inline uint64_t update_check_id_ = 0;  // a newer check makes an older answer stale
+  // Test input SETTING=dialog,down|press|back (hexic_input.h) drives the box.
+  static inline std::atomic<int> test_dialog_moves_{0};
+  static inline std::atomic<bool> test_dialog_press_{false}, test_dialog_back_{false};
+
+  static UpdateStatus CurrentUpdateStatus() {
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    return update_status_;
+  }
+
+  // The release folder's launcher (root\Hexic HD.exe, two folders above
+  // resources\runtime\hexic_hd.exe); empty outside the release layout.
+  static std::filesystem::path LauncherPath() {
+    wchar_t exe[32768] = {};
+    GetModuleFileNameW(nullptr, exe, 32768);
+    const std::filesystem::path runtime = std::filesystem::path(exe).parent_path();
+    if (_wcsicmp(runtime.filename().c_str(), L"runtime") != 0) return {};
+    const std::filesystem::path launcher = runtime.parent_path().parent_path() / L"Hexic HD.exe";
+    std::error_code ec;
+    return std::filesystem::exists(launcher, ec) ? launcher : std::filesystem::path();
+  }
+
+  static void StartUpdateCheck() {
+    uint64_t id = 0;
+    {
+      std::lock_guard<std::mutex> lock(update_mutex_);
+      update_status_ = UpdateStatus{};
+      update_status_.state = LauncherPath().empty() ? UpdateState::kNoLauncher : UpdateState::kChecking;
+      if (update_status_.state != UpdateState::kChecking) return;
+      id = ++update_check_id_;
+    }
+    std::thread([id] {
+      hexic_update::Release release;
+      std::string error;
+      const std::wstring agent = L"Hexic-HD-PC/" + hexic_update::Widen(HEXIC_VERSION);
+      bool ok = hexic_update::LatestRelease(release, agent, error);
+      const bool newer = ok && hexic_update::CompareVersions(release.version, HEXIC_VERSION) > 0;
+      if (newer && !release.asset_error.empty()) {  // newer, but its download can't be used
+        ok = false;
+        error = release.asset_error;
+      }
+      std::lock_guard<std::mutex> lock(update_mutex_);
+      if (id != update_check_id_ || update_status_.state != UpdateState::kChecking) return;  // closed meanwhile
+      update_status_.latest = release.version;
+      update_status_.size = release.zip_size;
+      update_status_.error = error;
+      update_status_.state = !ok ? UpdateState::kFailed : newer ? UpdateState::kAvailable : UpdateState::kUpToDate;
+      REXLOG_INFO("[update] latest release {} (this copy {}): {}", ok ? release.version : "?", HEXIC_VERSION,
+                  ok ? (update_status_.state == UpdateState::kAvailable ? "newer" : "not newer") : error);
+    }).detach();
+  }
+
+  // Updating closes the game, so only from the main menu (not mid-game, its
+  // pause menu or a level card).
+  static bool UpdateIsSafe() { return hexic_mouse::g_on_main_menu.load(std::memory_order_relaxed); }
+
+  // Starts the launcher's update window and closes the game (the window's
+  // close button path, which exits in a fraction of a second; a watchdog ends
+  // the process if that ever stalls, so the launcher is never left waiting).
+  bool StartUpdater() {
+    const std::filesystem::path launcher = LauncherPath();
+    if (launcher.empty()) return false;
+    std::wstring command = L"\"" + launcher.wstring() + L"\" --update";
+    STARTUPINFOW startup = {sizeof(startup)};
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        launcher.parent_path().c_str(), &startup, &process)) {
+      REXLOG_ERROR("[update] could not start the launcher (error {})", GetLastError());
+      return false;
+    }
+    AllowSetForegroundWindow(process.dwProcessId);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    REXLOG_INFO("[update] started the launcher's update; closing the game");
+    std::thread([] {
+      Sleep(10000);
+      REXLOG_WARN("[update] the game did not close in 10 s; ending it");
+      TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
+    if (game_window_) PostMessageW(game_window_, WM_CLOSE, 0, 0);
+    return true;
+  }
+
+  void OpenUpdateDialog() {
+    if (!imgui_drawer_) return;
+    StartUpdateCheck();
+    imgui_drawer_->AddDialog(new HexicUpdateDialog(imgui_drawer_, this));
+  }
+  void OnUpdateDialogClosed() {
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    update_status_.state = UpdateState::kIdle;
+  }
+
   // The name Hexic shows: the saved player name, else the Windows user name
   // (the SDK's netplay::PlayerName rule, which XamUserGetName follows).
   static std::string PlayerName() {
@@ -741,8 +1189,10 @@ class HexicHdApp : public rex::ReXApp {
 
   static std::string SavedPlayerName() { return rex::cvar::GetFlagByName("net_player_name"); }
 
+  // An empty name draws a new one from the list.
   void SetPlayerName(const std::string& name) {
-    rex::cvar::SetFlagByName("net_player_name", name);
+    rex::cvar::SetFlagByName("net_player_name",
+                             name.empty() ? hexic_player_names::Random() : name);
     SavePcSettings();
     REXLOG_INFO("[name] player name is now \"{}\"", PlayerName());
     RefreshGameGamertag();
@@ -807,6 +1257,45 @@ class HexicHdApp : public rex::ReXApp {
     if (!profile) return false;
     profile->set_signin_state(2);
     return true;
+  }
+
+  // SDL gives the window class only the large icon (LoadIcon), so Windows
+  // shrinks the 32 px flower for the title bar. Hand the game window both
+  // sizes from the exe's icon (src/hexic_hd.rc) at its DPI, so the title bar
+  // gets the icon's own small image (the three-gem cluster at 16 and 24 px).
+  static void ApplyWindowIcons() {
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+          DWORD pid = 0;
+          GetWindowThreadProcessId(hwnd, &pid);
+          if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd)) return TRUE;
+          game_window_ = hwnd;
+          const UINT dpi = GetDpiForWindow(hwnd) ? GetDpiForWindow(hwnd) : 96;
+          HINSTANCE module = GetModuleHandleW(nullptr);
+          auto load = [&](int metric) {
+            const int size = GetSystemMetricsForDpi(metric, dpi);
+            return reinterpret_cast<HICON>(
+                LoadImageW(module, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+          };
+          // Icons loaded this way live until the process ends, as the window does.
+          // ("small" is a macro in the Windows headers, hence these names.)
+          if (HICON icon_big = load(SM_CXICON)) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon_big));
+          }
+          if (HICON icon_small = load(SM_CXSMICON)) {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_small));
+          }
+          return TRUE;
+        },
+        0);
+  }
+
+  // The "Press A to continue" title screen is showing (see hexic_title.h).
+  bool OnTitleScreen() {
+    auto* memory = runtime() ? runtime()->memory() : nullptr;
+    if (!memory || !memory->LookupHeap(hexic_title::kActivePadSlot)) return false;
+    return rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual<uint8_t*>(
+               hexic_title::kActivePadSlot)) == hexic_title::kNoActivePad;
   }
 
   static void SavePcSettings() {
@@ -876,6 +1365,56 @@ class HexicHdApp : public rex::ReXApp {
     return 1;
   }
 
+  // Renderer: 0 Auto (Direct3D 12 on NVIDIA, Vulkan on other GPUs), 1 Direct3D
+  // 12, 2 Vulkan. The SDK reads the "gpu" cvar once at start, so a change
+  // applies on the next restart.
+  static int GetPcRenderer() {
+    const std::string value = rex::cvar::GetFlagByName("gpu");
+    return value == "d3d12" ? 1 : value == "vulkan" ? 2 : 0;
+  }
+
+  static void SetPcRenderer(int renderer) {
+    static const char* kValues[3] = {"auto", "d3d12", "vulkan"};
+    if (renderer >= 0 && renderer < 3 && rex::cvar::SetFlagByName("gpu", kValues[renderer])) {
+      SavePcSettings();
+    }
+  }
+
+  static bool PcRendererPendingRestart() { return GetPcRenderer() != startup_renderer_; }
+
+  // Anti-Aliasing: 0 Off, 1 FXAA, 2 FXAA Extreme (swap_post_effect, a filter on
+  // the finished picture). The SDK re-reads it every vblank, so it applies live.
+  static int GetPcAntiAliasing() {
+    const std::string value = rex::cvar::GetFlagByName("swap_post_effect");
+    return value == "fxaa" ? 1 : value == "fxaa_extreme" ? 2 : 0;
+  }
+
+  static void SetPcAntiAliasing(int mode) {
+    static const char* kValues[3] = {"none", "fxaa", "fxaa_extreme"};
+    if (mode >= 0 && mode < 3 && rex::cvar::SetFlagByName("swap_post_effect", kValues[mode])) {
+      SavePcSettings();
+    }
+  }
+
+  // Upscaling: off (bilinear) or AMD FSR 1, which scales the game's picture up
+  // to the window with sharper edges when the window is larger than the render
+  // size. present_effect is read by the presenter, so it is reloaded here.
+  static bool GetPcFsr() { return rex::cvar::GetFlagByName("present_effect") == "fsr"; }
+
+  static void SetPcFsr(bool enabled) {
+    HexicHdApp* app = current_instance_;
+    if (!app || !rex::cvar::SetFlagByName("present_effect", enabled ? "fsr" : "bilinear")) {
+      return;
+    }
+    SavePcSettings();
+    app->app_context().CallInUIThreadDeferred([app]() {
+      auto* graphics = app->runtime() ? app->runtime()->graphics_system() : nullptr;
+      if (graphics && graphics->presenter()) {
+        graphics->presenter()->ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
+      }
+    });
+  }
+
   static bool GetPcVSync() {
     std::string value = rex::cvar::GetFlagByName("vsync");
     return value == "true" || value == "1";
@@ -933,371 +1472,20 @@ class HexicHdApp : public rex::ReXApp {
 
  private:
   inline static HexicHdApp* current_instance_ = nullptr;
+  inline static int startup_renderer_ = 0;  // GetPcRenderer() when the game started
+  hexic_input::TestPresses test_presses_;
+  hexic_title::AnyKeyStarts any_key_starts_;
+  TitleInputListener title_input_{&any_key_starts_};
+  hexic_mouse::MenuMouse menu_mouse_;
+  inline static HWND game_window_ = nullptr;  // found by ApplyWindowIcons
   rex::ui::ImGuiDrawer* imgui_drawer_ = nullptr;
   int modal_depth_ = 0;
   std::chrono::steady_clock::time_point last_dialog_closed_time_{};
+  // The same, for the game thread (pad filter).
+  std::atomic<bool> modal_open_{false};
+  std::atomic<int64_t> modal_closed_at_{0};  // steady_clock ticks
 };
 
-inline HexicSettingsDialog::HexicSettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
-                                                HexicHdApp* app, int select_row)
-    : rex::ui::ImGuiDialog(imgui_drawer), app_(app), selected_row_(select_row) {
-  app_->BeginModal();
-}
-
-inline HexicSettingsDialog::InputEdges HexicSettingsDialog::PollInput() {
-  InputEdges edges;
-
-  // GetAsyncKeyState and XInput both read system-wide input state, not
-  // state scoped to this window. Without gating on focus, keys typed (or a
-  // controller used) in another application while the game is merely
-  // running in the background would still drive this dialog.
-  if (!app_ || !app_->HasWindowFocus()) {
-    return edges;
-  }
-
-  // Keyboard: Up/Down/Left/Right/Enter/Escape, edge-triggered.
-  int vks[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE};
-  bool now_down[6];
-  for (int i = 0; i < 6; ++i) {
-    now_down[i] = (GetAsyncKeyState(vks[i]) & 0x8000) != 0;
-  }
-
-  XINPUT_STATE state{};
-  bool pad_connected = XInputGetState(0, &state) == ERROR_SUCCESS;
-
-  if (!input_primed_) {
-    // Seed the "previous state" from whatever's currently held (typically
-    // the same A/Enter press that opened this dialog) without reporting it
-    // as an edge.
-    for (int i = 0; i < 6; ++i) {
-      key_was_down_[i] = now_down[i];
-    }
-    if (pad_connected) {
-      pad_was_connected_ = true;
-      pad_buttons_prev_ = state.Gamepad.wButtons;
-    }
-    input_primed_ = true;
-    return edges;
-  }
-
-  edges.up = now_down[0] && !key_was_down_[0];
-  edges.down = now_down[1] && !key_was_down_[1];
-  edges.left = now_down[2] && !key_was_down_[2];
-  edges.right = now_down[3] && !key_was_down_[3];
-  edges.confirm = now_down[4] && !key_was_down_[4];
-  edges.back = now_down[5] && !key_was_down_[5];
-  for (int i = 0; i < 6; ++i) {
-    key_was_down_[i] = now_down[i];
-  }
-
-  // Controller: XInput D-pad + A (confirm) + B (back), edge-triggered.
-  if (pad_connected) {
-    pad_was_connected_ = true;
-    WORD buttons = state.Gamepad.wButtons;
-    WORD pressed = buttons & ~pad_buttons_prev_;
-    if (pressed & XINPUT_GAMEPAD_DPAD_UP) edges.up = true;
-    if (pressed & XINPUT_GAMEPAD_DPAD_DOWN) edges.down = true;
-    if (pressed & XINPUT_GAMEPAD_DPAD_LEFT) edges.left = true;
-    if (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) edges.right = true;
-    if (pressed & XINPUT_GAMEPAD_A) edges.confirm = true;
-    if (pressed & XINPUT_GAMEPAD_B) edges.back = true;
-    pad_buttons_prev_ = buttons;
-  } else if (pad_was_connected_) {
-    pad_buttons_prev_ = 0;
-  }
-
-  return edges;
-}
-
-inline void HexicSettingsDialog::MoveSelection(int delta) {
-  selected_row_ = (selected_row_ + delta + kRowCount) % kRowCount;
-}
-
-inline void HexicSettingsDialog::CycleRow(int row, int delta) {
-  switch (row) {
-    case kRowFullscreen:
-      HexicHdApp::SetPcFullscreen(!HexicHdApp::GetPcFullscreen());
-      break;
-    case kRowResolution: {
-      static const int32_t kW[] = {1280, 1920, 2560, 3840};
-      static const int32_t kH[] = {720, 1080, 1440, 2160};
-      int index = HexicHdApp::GetPcResolutionIndex();
-      index = (index + delta + 4) % 4;
-      HexicHdApp::SetPcResolution(kW[index], kH[index]);
-      break;
-    }
-    case kRowRenderScale: {
-      const int scale = (HexicHdApp::GetPcRenderScale() - 1 + delta + 3) % 3 + 1;
-      HexicHdApp::SetPcRenderScale(scale);
-      break;
-    }
-    case kRowVSync:
-      HexicHdApp::SetPcVSync(!HexicHdApp::GetPcVSync());
-      break;
-    case kRowShowFps:
-      HexicHdApp::SetPcShowFps(!HexicHdApp::GetPcShowFps());
-      break;
-    default:
-      break;
-  }
-}
-
-inline void HexicSettingsDialog::ActivateRow(int row) {
-  // A/Enter opens Player Name and Keyboard Controls and closes on Done; every
-  // other row's value only changes via Left/Right, so a confirm press can't
-  // accidentally change a setting. A sub-dialog opens before this one
-  // closes, so the game's keyboard mapping stays off across the hand-over.
-  if (row == kRowPlayerName) {
-    app_->OpenNameEntry();
-  } else if (row == kRowControls) {
-    app_->OpenControls();
-  } else if (row != kRowDone) {
-    return;
-  }
-  ImGui::CloseCurrentPopup();
-  Close();
-}
-
-inline void HexicSettingsDialog::DrawRow(ImDrawList* draw_list, ImVec2 pos, ImVec2 size, int row,
-                                         bool selected, const char* label, const char* value,
-                                         bool has_value, bool show_chevrons) {
-  using namespace hexic_ui;
-
-  ImVec2 row_max(pos.x + size.x, pos.y + size.y);
-  DrawGamePill(draw_list, pos, row_max, selected);
-
-  ImFont* body_font = HexicFonts::body ? HexicFonts::body : ImGui::GetFont();
-  float label_size = body_font == HexicFonts::body ? 19.0f : ImGui::GetFontSize();
-  ImVec2 label_pos(pos.x + 22.0f, pos.y + (size.y - label_size) * 0.5f);
-  DrawPillText(draw_list, body_font, label_size, label_pos, kTextSelected, label);
-
-  if (has_value && !show_chevrons) {
-    // Rows that open a page (Player Name, Keyboard Controls): the value sits
-    // at the right edge, with no arrows implying Left/Right changes it.
-    ImVec2 value_text_size = body_font->CalcTextSizeA(label_size, FLT_MAX, 0, value);
-    ImVec2 value_pos(row_max.x - 22.0f - value_text_size.x, pos.y + (size.y - label_size) * 0.5f);
-    DrawPillText(draw_list, body_font, label_size, value_pos, IM_COL32(0xF0, 0xF0, 0xFA, 255),
-                 value);
-  } else if (has_value) {
-    float chevron_inset = 34.0f;
-    // White arrows read cleanly on both the purple and green pills; the game
-    // uses the same bright arrows flanking its own value controls.
-    ImU32 chevron_color = IM_COL32(0xFF, 0xFF, 0xFF, selected ? 255 : 210);
-    DrawChevron(draw_list, ImVec2(row_max.x - size.x * 0.42f, pos.y + size.y * 0.5f), 7.0f, false,
-               chevron_color);
-    DrawChevron(draw_list, ImVec2(row_max.x - chevron_inset, pos.y + size.y * 0.5f), 7.0f, true,
-               chevron_color);
-
-    // Center the value text between the two chevrons.
-    ImVec2 value_text_size = body_font->CalcTextSizeA(label_size, FLT_MAX, 0, value);
-    float center_x = row_max.x - (size.x * 0.42f + chevron_inset) * 0.5f;
-    ImVec2 value_pos(center_x - value_text_size.x * 0.5f, pos.y + (size.y - label_size) * 0.5f);
-    DrawPillText(draw_list, body_font, label_size, value_pos, IM_COL32(0xF0, 0xF0, 0xFA, 255),
-                 value);
-  }
-}
-
-inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
-  if (!has_opened_shown_) {
-    ImGui::OpenPopup("##HexicPcSettings");
-    has_opened_shown_ = true;
-  }
-
-  using namespace hexic_ui;
-
-  InputEdges input = PollInput();
-  if (input.up) MoveSelection(-1);
-  if (input.down) MoveSelection(1);
-  if (input.left) CycleRow(selected_row_, -1);
-  if (input.right) CycleRow(selected_row_, 1);
-  if (input.confirm) ActivateRow(selected_row_);
-
-  // Recompute every frame (ImGuiCond_Always) rather than only on first
-  // appearance, so the panel stays centered even if the resolution row
-  // changes the display size while this dialog is still open.
-  ImGuiViewport* viewport = ImGui::GetMainViewport();
-  ImVec2 viewport_center =
-      viewport ? ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
-                        viewport->WorkPos.y + viewport->WorkSize.y * 0.5f)
-               : ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-  ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-
-  constexpr float kWindowWidth = 480.0f;
-  ImGui::SetNextWindowSize(ImVec2(kWindowWidth, 0), ImGuiCond_Always);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-  // Transparent window: only the drawn card and its glow show over the game,
-  // so the panel reads as a floating menu rather than a black box.
-  ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-
-  bool still_open =
-      ImGui::BeginPopupModal("##HexicPcSettings", nullptr,
-                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-  if (still_open) {
-    if (input.back) {
-      ImGui::CloseCurrentPopup();
-      Close();
-    }
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    ImVec2 window_pos = ImGui::GetWindowPos();
-
-    constexpr int kRows = kRowCount;
-    constexpr float kRowHeight = 46.0f;
-    constexpr float kRowSpacing = 10.0f;
-    constexpr float kSideMargin = 26.0f;
-    constexpr float kTopContent = 78.0f;
-    constexpr float kBottomMargin = 22.0f;
-    float content_height =
-        kTopContent + kRows * kRowHeight + (kRows - 1) * kRowSpacing + kBottomMargin;
-    ImVec2 window_size(kWindowWidth, content_height);
-    ImVec2 window_end(window_pos.x + window_size.x, window_pos.y + window_size.y);
-
-    ImGui::Dummy(window_size);
-
-    DrawHexicCard(draw_list, window_pos, window_end, kSideMargin, "SETTINGS");
-
-    static const char* kRowLabels[kRowCount] = {
-        "Player Name",
-        "Display Mode",
-        "Resolution",
-        "Render Scale",
-        "VSync",
-        "Show FPS",
-        "Keyboard Controls",
-        "Done",
-    };
-    static const char* kResolutionValues[4] = {
-        "1280 x 720",
-        "1920 x 1080",
-        "2560 x 1440",
-        "3840 x 2160",
-    };
-
-    float row_y = window_pos.y + kTopContent;
-    for (int row = 0; row < kRows; ++row) {
-      ImVec2 row_pos(window_pos.x + kSideMargin, row_y);
-      ImVec2 row_size(window_size.x - kSideMargin * 2.0f, kRowHeight);
-      bool selected = (row == selected_row_);
-
-      const char* value = nullptr;
-      bool has_value = true;
-      std::string value_storage;
-      const bool opens_page = row == kRowPlayerName || row == kRowControls;
-      switch (row) {
-        case kRowPlayerName:
-          value_storage = HexicHdApp::PlayerName();
-          value = value_storage.c_str();
-          break;
-        case kRowControls:
-          value = "Customize";
-          break;
-        case kRowFullscreen:
-          value = HexicHdApp::GetPcFullscreen() ? "Fullscreen" : "Windowed";
-          break;
-        case kRowResolution:
-          value = kResolutionValues[HexicHdApp::GetPcResolutionIndex()];
-          break;
-        case kRowRenderScale: {
-          static const char* kScaleValues[3] = {"1x", "2x", "3x"};
-          value = kScaleValues[HexicHdApp::GetPcRenderScale() - 1];
-          break;
-        }
-        case kRowVSync:
-          value = HexicHdApp::GetPcVSync() ? "On" : "Off";
-          break;
-        case kRowShowFps:
-          value = HexicHdApp::GetPcShowFps() ? "On" : "Off";
-          break;
-        default:
-          has_value = false;
-          value = "";
-          break;
-      }
-
-      // Done reads as a full-width action row, not a value spinner - a glossy
-      // pill with its label centred, matching the game's own menu buttons.
-      bool is_action_row = (row == kRowDone);
-      if (is_action_row) {
-        ImVec2 row_max(row_pos.x + row_size.x, row_pos.y + row_size.y);
-        DrawGamePill(draw_list, row_pos, row_max, selected);
-        ImFont* body_font = HexicFonts::body ? HexicFonts::body : ImGui::GetFont();
-        float font_size = HexicFonts::body ? 19.0f : ImGui::GetFontSize();
-        ImVec2 text_size = body_font->CalcTextSizeA(font_size, FLT_MAX, 0, kRowLabels[row]);
-        ImVec2 text_pos(row_pos.x + (row_size.x - text_size.x) * 0.5f,
-                        row_pos.y + (row_size.y - font_size) * 0.5f);
-        DrawPillText(draw_list, body_font, font_size, text_pos, kTextSelected, kRowLabels[row]);
-      } else {
-        DrawRow(draw_list, row_pos, row_size, row, selected, kRowLabels[row], value, has_value,
-                !opens_page);
-      }
-
-      // Mouse fallback. Done is a single full-width activation button.
-      // Every other row only changes value via
-      // the drawn left/right chevrons (matching Left/Right being the only
-      // way to change a value); clicking anywhere else on the row just
-      // selects it, same as clicking any other non-actionable row.
-      ImGui::PushID(row);
-      if (is_action_row || opens_page) {
-        ImGui::SetCursorScreenPos(row_pos);
-        if (ImGui::InvisibleButton("row", row_size)) {
-          selected_row_ = row;
-          ActivateRow(row);
-        }
-      } else if (has_value) {
-        float row_right = row_pos.x + row_size.x;
-        float chevron_left_x = row_right - row_size.x * 0.42f;
-        float chevron_right_x = row_right - 34.0f;
-        constexpr float kChevronHitHalfWidth = 20.0f;
-        float band1_end = chevron_left_x - kChevronHitHalfWidth;
-        float band2_end = chevron_left_x + kChevronHitHalfWidth;
-        float band3_end = chevron_right_x - kChevronHitHalfWidth;
-        float band4_end = chevron_right_x + kChevronHitHalfWidth;
-
-        auto place_band = [&](const char* id, float x0, float x1b) {
-          if (x1b <= x0) return false;
-          ImGui::SetCursorScreenPos(ImVec2(x0, row_pos.y));
-          return ImGui::InvisibleButton(id, ImVec2(x1b - x0, row_size.y));
-        };
-
-        if (place_band("b1", row_pos.x, band1_end)) selected_row_ = row;
-        if (place_band("b2", band1_end, band2_end)) {
-          selected_row_ = row;
-          CycleRow(row, -1);
-        }
-        if (place_band("b3", band2_end, band3_end)) selected_row_ = row;
-        if (place_band("b4", band3_end, band4_end)) {
-          selected_row_ = row;
-          CycleRow(row, 1);
-        }
-        if (place_band("b5", band4_end, row_right)) selected_row_ = row;
-      } else {
-        ImGui::SetCursorScreenPos(row_pos);
-        if (ImGui::InvisibleButton("row", row_size)) {
-          selected_row_ = row;
-        }
-      }
-      ImGui::PopID();
-
-      row_y += kRowHeight + kRowSpacing;
-    }
-
-    ImGui::EndPopup();
-  }
-
-  ImGui::PopStyleColor(1);
-  ImGui::PopStyleVar(3);
-
-  if (!still_open) {
-    // Popup was dismissed some other way; close the dialog.
-    Close();
-  }
-}
-
-inline void HexicSettingsDialog::OnClose() {
-  if (app_) app_->EndModal();
-}
 
 namespace hexic_ui {
 
@@ -1332,6 +1520,335 @@ inline void DrawHint(ImDrawList* draw_list, float x0, float x1, float y, const c
 }
 
 }  // namespace hexic_ui
+
+// --- Settings -------------------------------------------------------------
+
+namespace hexic_settings_ui {
+// Clean, flat palette: a dark panel over the dimmed game, Hexic's green for
+// the current choice and the selection marker.
+constexpr ImU32 kDim = IM_COL32(0x05, 0x04, 0x0E, 150);
+constexpr ImU32 kPanel = IM_COL32(0x10, 0x0C, 0x26, 242);
+constexpr ImU32 kSidebar = IM_COL32(0x0A, 0x07, 0x19, 255);
+constexpr ImU32 kInk = IM_COL32(0xF4, 0xF2, 0xFF, 255);
+constexpr ImU32 kSoft = IM_COL32(0xDC, 0xD8, 0xF2, 255);
+constexpr ImU32 kMuted = IM_COL32(0x9C, 0x97, 0xC4, 255);
+constexpr ImU32 kFaint = IM_COL32(0x6E, 0x68, 0xA0, 255);
+constexpr ImU32 kGreen = IM_COL32(0x7D, 0xE3, 0x6A, 255);
+constexpr ImU32 kOnGreen = IM_COL32(0x0C, 0x2A, 0x06, 255);
+constexpr ImU32 kHover = IM_COL32(0xFF, 0xFF, 0xFF, 14);
+constexpr ImU32 kOutline = IM_COL32(0xFF, 0xFF, 0xFF, 44);
+constexpr ImU32 kOutlineFocus = IM_COL32(0xFF, 0xFF, 0xFF, 110);
+
+constexpr float kWidth = 780.0f;
+constexpr float kHeight = 440.0f;
+constexpr float kSidebarWidth = 220.0f;
+constexpr float kRowHeight = 50.0f;
+constexpr float kRowPitch = 58.0f;
+
+inline ImFont* Font() { return HexicFonts::body ? HexicFonts::body : ImGui::GetFont(); }
+inline ImFont* TitleFont() { return HexicFonts::heading ? HexicFonts::heading : Font(); }
+
+inline void Text(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, ImU32 color, const char* text) {
+  dl->AddText(font, size, pos, color, text);
+}
+inline float Width(ImFont* font, float size, const char* text) {
+  return font->CalcTextSizeA(size, FLT_MAX, 0, text).x;
+}
+inline bool Inside(ImVec2 p, ImVec2 lo, ImVec2 hi) {
+  return p.x >= lo.x && p.x < hi.x && p.y >= lo.y && p.y < hi.y;
+}
+}  // namespace hexic_settings_ui
+
+inline HexicSettingsDialog::HexicSettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
+                                                HexicHdApp* app, int select_item)
+    : rex::ui::ImGuiDialog(imgui_drawer), app_(app) {
+  item_ = (select_item >= 0 && select_item < kItemCount) ? select_item : kItemDisplayMode;
+  category_ = CategoryOf(item_);
+  app_->BeginModal();
+}
+
+inline void HexicSettingsDialog::OnClose() {
+  if (app_) app_->EndModal();
+}
+
+inline HexicSettingsDialog::Category HexicSettingsDialog::CategoryOf(int item) {
+  if (item <= kItemShowFps) return kDisplay;
+  if (item <= kItemRenderer) return kGraphics;
+  if (item == kRowUpdates) return kUpdates;
+  return item == kRowPlayerName ? kPlayer : kControls;
+}
+
+inline int HexicSettingsDialog::FirstItem(Category category) {
+  static const int kFirst[kCategoryCount] = {kItemDisplayMode, kItemRenderScale, kRowPlayerName,
+                                             kRowControls, kRowUpdates};
+  return kFirst[category];
+}
+
+inline int HexicSettingsDialog::ItemCount(Category category) {
+  static const int kCount[kCategoryCount] = {4, 4, 1, 1, 1};
+  return kCount[category];
+}
+
+inline std::vector<const char*> HexicSettingsDialog::Options(int item) {
+  switch (item) {
+    case kItemDisplayMode: return {"Windowed", "Fullscreen"};
+    case kItemResolution: return {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+    case kItemVSync: return {"Off", "On"};
+    case kItemShowFps: return {"Off", "On"};
+    case kItemRenderScale: return {"1x", "2x", "3x"};
+    case kItemAntiAliasing: return {"Off", "FXAA", "Extreme"};
+    case kItemUpscaling: return {"Off", "FSR"};
+    case kItemRenderer: return {"Auto", "D3D12", "Vulkan"};
+    default: return {};
+  }
+}
+
+inline int HexicSettingsDialog::Current(int item) {
+  switch (item) {
+    case kItemDisplayMode: return HexicHdApp::GetPcFullscreen() ? 1 : 0;
+    case kItemResolution: return HexicHdApp::GetPcResolutionIndex();
+    case kItemVSync: return HexicHdApp::GetPcVSync() ? 1 : 0;
+    case kItemShowFps: return HexicHdApp::GetPcShowFps() ? 1 : 0;
+    case kItemRenderScale: return HexicHdApp::GetPcRenderScale() - 1;
+    case kItemAntiAliasing: return HexicHdApp::GetPcAntiAliasing();
+    case kItemUpscaling: return HexicHdApp::GetPcFsr() ? 1 : 0;
+    case kItemRenderer: return HexicHdApp::GetPcRenderer();
+    default: return 0;
+  }
+}
+
+inline void HexicSettingsDialog::Choose(int item, int option) {
+  if (option == Current(item)) return;
+  switch (item) {
+    case kItemDisplayMode: HexicHdApp::SetPcFullscreen(option == 1); break;
+    case kItemResolution: {
+      static const int32_t kW[] = {1280, 1920, 2560, 3840};
+      static const int32_t kH[] = {720, 1080, 1440, 2160};
+      HexicHdApp::SetPcResolution(kW[option], kH[option]);
+      break;
+    }
+    case kItemVSync: HexicHdApp::SetPcVSync(option == 1); break;
+    case kItemShowFps: HexicHdApp::SetPcShowFps(option == 1); break;
+    case kItemRenderScale: HexicHdApp::SetPcRenderScale(option + 1); break;
+    case kItemAntiAliasing: HexicHdApp::SetPcAntiAliasing(option); break;
+    case kItemUpscaling: HexicHdApp::SetPcFsr(option == 1); break;
+    case kItemRenderer: HexicHdApp::SetPcRenderer(option); break;
+    default: break;
+  }
+}
+
+inline const char* HexicSettingsDialog::Label(int item) {
+  static const char* kLabels[kItemCount] = {
+      "Display mode",  "Window size", "VSync",    "Show FPS",    "Render scale",
+      "Anti-aliasing", "Upscaling",  "Renderer", "Player name", "Keyboard controls",
+      "Check for Updates",
+  };
+  return kLabels[item];
+}
+
+inline std::string HexicSettingsDialog::Help(int item) {
+  switch (item) {
+    case kItemDisplayMode: return "Play in a window or fill the screen";
+    case kItemResolution:
+      return HexicHdApp::GetPcFullscreen() ? "Used when windowed. Fullscreen fills the display"
+                                           : "The size of the game window";
+    case kItemVSync:
+      return "Always 60 fps. On: no tearing" +
+             std::string(HexicHdApp::GetPcRenderer() == 2 ? " (Vulkan: applies after a restart)" : "");
+    case kItemShowFps: return "Frame rate in the top corner";
+    case kItemRenderScale: return "Draws the game at 2 or 3 times the detail. Sharper, more work";
+    case kItemAntiAliasing: return "Smooths edges on the finished picture";
+    case kItemUpscaling: return "Sharper picture when the window is bigger than 1280 x 720";
+    case kItemRenderer:
+      return HexicHdApp::PcRendererPendingRestart()
+                 ? "Applies the next time you start the game"
+                 : "Auto: Direct3D 12 on NVIDIA, Vulkan on AMD and Intel";
+    case kRowPlayerName: return "Shown on High Scores";
+    case kRowControls: return "Change the key for every controller button";
+    case kRowUpdates: return "Asks GitHub for a newer version. Nothing is checked unless you ask";
+    default: return "";
+  }
+}
+
+inline void HexicSettingsDialog::SelectCategory(Category category) {
+  category_ = category;
+  item_ = FirstItem(category);
+}
+
+// Player name and Keyboard controls open their own page; this panel closes
+// after the page opens, so the game's keyboard mapping stays off in between.
+inline void HexicSettingsDialog::Activate(int item) {
+  if (item == kRowPlayerName) {
+    app_->OpenNameEntry();
+  } else if (item == kRowControls) {
+    app_->OpenControls();
+  } else if (item == kRowUpdates) {
+    app_->OpenUpdateDialog();
+  } else {
+    return;
+  }
+  ImGui::CloseCurrentPopup();
+  Close();
+}
+
+inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
+  using namespace hexic_settings_ui;
+  if (!has_opened_shown_) {
+    ImGui::OpenPopup("##HexicSettings");
+    has_opened_shown_ = true;
+  }
+
+  // Keyboard and controller.
+  input_.Poll(app_ && app_->HasWindowFocus());
+  const int first = FirstItem(category_);
+  const int count = ItemCount(category_);
+  bool close = false;
+  if (input_.Pressed(HexicMenuInput::kPrevPage))
+    SelectCategory(Category((category_ + kCategoryCount - 1) % kCategoryCount));
+  if (input_.Pressed(HexicMenuInput::kNextPage))
+    SelectCategory(Category((category_ + 1) % kCategoryCount));
+  if (input_.Pressed(HexicMenuInput::kUp)) item_ = first + (item_ - first + count - 1) % count;
+  if (input_.Pressed(HexicMenuInput::kDown)) item_ = first + (item_ - first + 1) % count;
+  const auto options = Options(item_);
+  if (!options.empty()) {
+    const int n = int(options.size());
+    if (input_.Pressed(HexicMenuInput::kLeft)) Choose(item_, (Current(item_) + n - 1) % n);
+    if (input_.Pressed(HexicMenuInput::kRight)) Choose(item_, (Current(item_) + 1) % n);
+  }
+  if (input_.Pressed(HexicMenuInput::kBack)) close = true;
+
+  ImGuiViewport* viewport = ImGui::GetMainViewport();
+  const ImVec2 view_pos = viewport ? viewport->Pos : ImVec2(0, 0);
+  const ImVec2 view_size = viewport ? viewport->Size : io.DisplaySize;
+  // Dim the game behind the panel.
+  ImGui::GetBackgroundDrawList()->AddRectFilled(
+      view_pos, ImVec2(view_pos.x + view_size.x, view_pos.y + view_size.y), kDim);
+
+  ImGui::SetNextWindowPos(ImVec2(view_pos.x + view_size.x * 0.5f, view_pos.y + view_size.y * 0.5f),
+                          ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(kWidth, kHeight), ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+  ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, IM_COL32(0, 0, 0, 0));
+  const bool open = ImGui::BeginPopupModal(
+      "##HexicSettings", nullptr,
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings);
+  if (open) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetWindowPos();
+    const ImVec2 end(o.x + kWidth, o.y + kHeight);
+    ImGui::Dummy(ImVec2(kWidth, kHeight));
+
+    // Mouse: hovering selects (only when the mouse moves, so it never fights
+    // the keys), left click chooses, right click closes.
+    const ImVec2 mouse = io.MousePos;
+    const bool mouse_moved = mouse.x != last_mouse_.x || mouse.y != last_mouse_.y;
+    last_mouse_ = mouse;
+    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) close = true;
+
+    // Panel and sidebar.
+    dl->AddRectFilled(o, end, kPanel, 14.0f);
+    dl->AddRectFilled(o, ImVec2(o.x + kSidebarWidth, end.y), kSidebar, 14.0f,
+                      ImDrawFlags_RoundCornersLeft);
+
+    ImFont* font = Font();
+    Text(dl, TitleFont(), 27.0f, ImVec2(o.x + 28.0f, o.y + 26.0f), kInk, "Settings");
+    static const char* kCategoryNames[kCategoryCount] = {"Display", "Graphics", "Player",
+                                                         "Controls", "Updates"};
+    for (int c = 0; c < kCategoryCount; ++c) {
+      const ImVec2 lo(o.x + 14.0f, o.y + 86.0f + c * 44.0f);
+      const ImVec2 hi(o.x + kSidebarWidth - 14.0f, lo.y + 36.0f);
+      const bool hovered = Inside(mouse, lo, hi);
+      if (hovered && click) SelectCategory(Category(c));
+      const bool on = c == category_;
+      if (on || hovered) dl->AddRectFilled(lo, hi, on ? IM_COL32(0xFF, 0xFF, 0xFF, 18) : kHover, 6.0f);
+      if (on) dl->AddRectFilled(ImVec2(lo.x, lo.y + 9.0f), ImVec2(lo.x + 3.0f, hi.y - 9.0f), kGreen);
+      Text(dl, font, 19.0f, ImVec2(lo.x + 16.0f, lo.y + 8.0f), on ? kInk : kMuted,
+           kCategoryNames[c]);
+    }
+
+    // The chosen category's settings.
+    const float content_x = o.x + kSidebarWidth + 24.0f;
+    const float right_x = end.x - 28.0f;
+    for (int i = 0; i < ItemCount(category_); ++i) {
+      const int item = FirstItem(category_) + i;
+      const ImVec2 lo(content_x - 12.0f, o.y + 40.0f + i * kRowPitch);
+      const ImVec2 hi(right_x + 12.0f, lo.y + kRowHeight);
+      const bool row_hovered = Inside(mouse, lo, hi);
+      if (row_hovered && mouse_moved) item_ = item;
+      const bool focused = item == item_;
+      if (focused) {
+        dl->AddRectFilled(lo, hi, IM_COL32(0xFF, 0xFF, 0xFF, 10), 8.0f);
+        dl->AddRectFilled(ImVec2(lo.x, lo.y + 13.0f), ImVec2(lo.x + 3.0f, hi.y - 13.0f), kGreen);
+      }
+      const float text_y = lo.y + (kRowHeight - 19.0f) * 0.5f;
+      Text(dl, font, 19.0f, ImVec2(content_x + 8.0f, text_y), focused ? kInk : kSoft, Label(item));
+
+      const auto choices = Options(item);
+      if (choices.empty()) {
+        // A page: its current value, and a chevron.
+        std::string value = item == kRowPlayerName ? HexicHdApp::PlayerName()
+                            : item == kRowUpdates  ? std::string("v") + HEXIC_VERSION
+                                                   : std::string("Customize");
+        value += "   >";
+        Text(dl, font, 19.0f, ImVec2(right_x - Width(font, 19.0f, value.c_str()), text_y),
+             focused ? kInk : kMuted, value.c_str());
+        if (row_hovered && click) Activate(item);
+        continue;
+      }
+      // Every choice as a segment, right-aligned; the current one filled.
+      const int n = int(choices.size());
+      // Wide enough for the longest choice ("3840 x 2160").
+      float seg_w = n >= 4 ? 72.0f : 86.0f;
+      for (const char* choice : choices) seg_w = std::max(seg_w, Width(font, 17.0f, choice) + 22.0f);
+      const float seg_h = 32.0f;
+      const int current = Current(item);
+      for (int k = 0; k < n; ++k) {
+        const ImVec2 slo(right_x - (n - k) * seg_w + 6.0f, lo.y + (kRowHeight - seg_h) * 0.5f);
+        const ImVec2 shi(slo.x + seg_w - 6.0f, slo.y + seg_h);
+        const bool seg_hovered = Inside(mouse, slo, shi);
+        if (seg_hovered && click) {
+          item_ = item;
+          Choose(item, k);
+        }
+        const float tw = Width(font, 17.0f, choices[k]);
+        const ImVec2 tpos(slo.x + (seg_w - 6.0f - tw) * 0.5f, slo.y + (seg_h - 17.0f) * 0.5f);
+        if (k == Current(item)) {
+          dl->AddRectFilled(slo, shi, kGreen, 6.0f);
+          Text(dl, font, 17.0f, tpos, kOnGreen, choices[k]);
+        } else {
+          if (seg_hovered) dl->AddRectFilled(slo, shi, kHover, 6.0f);
+          dl->AddRect(slo, shi, focused ? kOutlineFocus : kOutline, 6.0f, 0, 1.0f);
+          Text(dl, font, 17.0f, tpos, focused ? kSoft : kMuted, choices[k]);
+        }
+      }
+      (void)current;
+    }
+
+    // What the selected setting does, and the controls.
+    const std::string help = Help(item_);
+    Text(dl, font, 16.0f, ImVec2(content_x + 8.0f, end.y - 82.0f), kMuted, help.c_str());
+    // Hints for the device in use (hexic_input_mode.h).
+    const char* hints = hexic_input_mode::UsingController()
+                            ? "LB / RB  Category      D-pad  Change      A  Open      B  Back"
+                            : "Q / E  Category      Arrows  Change      Enter  Open      Esc  Back";
+    Text(dl, font, 15.0f, ImVec2(content_x + 8.0f, end.y - 46.0f), kFaint, hints);
+
+    if (input_.Pressed(HexicMenuInput::kConfirm)) Activate(item_);
+    if (close) {
+      ImGui::CloseCurrentPopup();
+      Close();
+    }
+    ImGui::EndPopup();
+  }
+  ImGui::PopStyleColor(2);
+  ImGui::PopStyleVar(3);
+  if (!open) Close();
+}
 
 // --- Player Name ---------------------------------------------------------
 
@@ -1392,10 +1909,8 @@ inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
     const ImVec2 text_pos(box_min.x + 16.0f, box_min.y + (50.0f - BodySize()) * 0.5f);
     float caret_x = text_pos.x;
     if (text_.empty()) {
-      const std::string placeholder =
-          "Windows user name (" + rex::kernel::xam::netplay::ConfiguredPlayerName("") + ")";
       draw_list->AddText(BodyFont(), BodySize(), text_pos, IM_COL32(0x9A, 0x94, 0xB8, 200),
-                         placeholder.c_str());
+                         "Leave empty for a random name");
     } else {
       DrawPillText(draw_list, BodyFont(), BodySize(), text_pos, kTextSelected, text_.c_str());
       caret_x += BodyFont()->CalcTextSizeA(BodySize(), FLT_MAX, 0, text_.c_str()).x + 2.0f;
@@ -1429,6 +1944,156 @@ inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
 }
 
 inline void HexicNameEntryDialog::OnClose() { app_->EndModal(); }
+
+// --- Check for Updates --------------------------------------------------------
+
+inline HexicUpdateDialog::HexicUpdateDialog(rex::ui::ImGuiDrawer* imgui_drawer, HexicHdApp* app)
+    : rex::ui::ImGuiDialog(imgui_drawer), app_(app) {
+  app_->BeginModal();
+}
+
+inline void HexicUpdateDialog::OnClose() {
+  app_->OnUpdateDialogClosed();
+  app_->EndModal();
+}
+
+inline void HexicUpdateDialog::OnDraw(ImGuiIO& io) {
+  using namespace hexic_ui;
+  using State = HexicHdApp::UpdateState;
+  const auto now = std::chrono::steady_clock::now();
+  if (!has_opened_shown_) {
+    ImGui::OpenPopup("##HexicUpdate");
+    has_opened_shown_ = true;
+    opened_at_ = now;
+  }
+
+  // The answer so far, and the buttons that go with it.
+  const HexicHdApp::UpdateStatus status = HexicHdApp::CurrentUpdateStatus();
+  const bool safe = HexicHdApp::UpdateIsSafe();
+  const std::string current = HEXIC_VERSION;
+  std::string line1, line2;
+  std::vector<const char*> buttons;
+  bool offer = false;
+  switch (status.state) {
+    case State::kIdle:
+    case State::kChecking: {
+      const int dots = int(std::chrono::duration_cast<std::chrono::milliseconds>(now - opened_at_).count() / 400 % 4);
+      line1 = "Asking GitHub for the latest release" + std::string(size_t(dots), '.');
+      buttons = {"Cancel"};
+      break;
+    }
+    case State::kUpToDate:
+      line1 = "Hexic HD is up to date (v" + current + ").";
+      buttons = {"OK"};
+      break;
+    case State::kFailed:
+      line1 = "Could not check for updates: " + status.error + ".";
+      line2 = "Check your internet connection and try again later.";
+      buttons = {"OK"};
+      break;
+    case State::kNoLauncher:
+      line1 = "Updates work in the release folder, where Hexic HD.exe sits beside the resources folder.";
+      buttons = {"OK"};
+      break;
+    case State::kAvailable:
+      line1 = "Version " + status.latest + " is available. You have " + current + ".";
+      if (updating_) {
+        line2 = "Closing the game for the update...";
+      } else if (!safe) {
+        line2 = "Updating closes the game. Quit to the main menu first, then try again.";
+        buttons = {"OK"};
+      } else {
+        char size[32] = "";
+        if (status.size) std::snprintf(size, sizeof(size), " (%.0f MB)", status.size / 1048576.0);
+        line2 = std::string("The game closes, the update downloads") + size +
+                " and installs, then the game starts again. Your saves and settings are kept.";
+        buttons = {"Update", "Cancel"};
+        offer = true;
+      }
+      break;
+  }
+  const int count = int(buttons.size());
+  if (selected_ >= count) selected_ = 0;
+
+  // Keyboard and controller (and the test hooks).
+  input_.Poll(app_ && app_->HasWindowFocus());
+  int moves = HexicHdApp::test_dialog_moves_.exchange(0);
+  if (input_.Pressed(HexicMenuInput::kRight) || input_.Pressed(HexicMenuInput::kDown)) ++moves;
+  if (input_.Pressed(HexicMenuInput::kLeft) || input_.Pressed(HexicMenuInput::kUp)) --moves;
+  if (count > 0) selected_ = ((selected_ + moves) % count + count) % count;
+  int press = -1;
+  if (input_.Pressed(HexicMenuInput::kConfirm) || HexicHdApp::test_dialog_press_.exchange(false)) press = selected_;
+  bool back = input_.Pressed(HexicMenuInput::kBack) || HexicHdApp::test_dialog_back_.exchange(false);
+
+  constexpr float kWindowWidth = 600.0f, kSideMargin = 28.0f;
+  constexpr float kButtonWidth = 190.0f, kButtonHeight = 50.0f, kButtonGap = 18.0f;
+  const float wrap = kWindowWidth - kSideMargin * 2.0f;
+  ImFont* font = BodyFont();
+  const float size = BodySize();
+  const float h1 = font->CalcTextSizeA(size, FLT_MAX, wrap, line1.c_str()).y;
+  const float h2 = line2.empty() ? 0.0f : font->CalcTextSizeA(size, FLT_MAX, wrap, line2.c_str()).y;
+  const float heading_block = 20.0f + 27.0f + 8.0f;  // DrawHexicCard: heading, then the accent line
+  const float text_top = heading_block + 22.0f;
+  const float buttons_top = text_top + h1 + (h2 > 0 ? 10.0f + h2 : 0.0f) + 26.0f;
+  const float hint_top = buttons_top + (count ? kButtonHeight + 22.0f : 0.0f);
+  const float window_height = hint_top + size + 24.0f;
+
+  PushDialogStyle(io, kWindowWidth);
+  const bool still_open = ImGui::BeginPopupModal("##HexicUpdate", nullptr,
+                                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+  if (still_open) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetWindowPos();
+    const ImVec2 end(o.x + kWindowWidth, o.y + window_height);
+    ImGui::Dummy(ImVec2(kWindowWidth, window_height));
+    DrawHexicCard(dl, o, end, kSideMargin, "CHECK FOR UPDATES");
+    dl->AddText(font, size, ImVec2(o.x + kSideMargin, o.y + text_top), kTextNormal, line1.c_str(), nullptr, wrap);
+    if (h2 > 0) {
+      dl->AddText(font, size, ImVec2(o.x + kSideMargin, o.y + text_top + h1 + 10.0f), kTextDim, line2.c_str(),
+                  nullptr, wrap);
+    }
+
+    // The buttons, centred: hover chooses, click presses, right click closes.
+    const ImVec2 mouse = io.MousePos;
+    const bool mouse_moved = mouse.x != last_mouse_.x || mouse.y != last_mouse_.y;
+    last_mouse_ = mouse;
+    const float row_width = count * kButtonWidth + (count - 1) * kButtonGap;
+    float x = o.x + (kWindowWidth - row_width) * 0.5f;
+    for (int i = 0; i < count; ++i, x += kButtonWidth + kButtonGap) {
+      const ImVec2 lo(x, o.y + buttons_top), hi(x + kButtonWidth, o.y + buttons_top + kButtonHeight);
+      const bool hovered = mouse.x >= lo.x && mouse.x < hi.x && mouse.y >= lo.y && mouse.y < hi.y;
+      if (hovered && mouse_moved) selected_ = i;
+      if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) press = i;
+      DrawGamePill(dl, lo, hi, i == selected_);
+      const ImVec2 text = font->CalcTextSizeA(size, FLT_MAX, 0, buttons[i]);
+      DrawPillText(dl, font, size, ImVec2(lo.x + (kButtonWidth - text.x) * 0.5f, lo.y + (kButtonHeight - text.y) * 0.5f),
+                   kTextSelected, buttons[i]);
+    }
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) back = true;
+
+    // Hints for the device in use (no pad glyphs on keyboard and mouse).
+    if (count) {
+      DrawHint(dl, o.x, end.x, o.y + hint_top,
+               hexic_input_mode::UsingController() ? "A  Select        B  Back"
+                                                   : "Enter / Click  Select        Esc / Right click  Back");
+    }
+
+    // A press, or Back (which is Cancel / OK). Nothing while the game closes.
+    if (!updating_ && (press >= 0 || back)) {
+      const bool update = offer && press == 0 && !back;
+      if (update && HexicHdApp::UpdateIsSafe() && app_->StartUpdater()) {
+        updating_ = true;
+      } else {
+        app_->OpenSettings(HexicSettingsDialog::kRowUpdates);
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+    }
+    ImGui::EndPopup();
+  }
+  PopDialogStyle();
+  if (!still_open) Close();
+}
 
 // --- Keyboard Controls ---------------------------------------------------
 

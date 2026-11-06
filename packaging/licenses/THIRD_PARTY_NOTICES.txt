@@ -40,6 +40,15 @@ AES-128                              see       LICENSE-aes_128.txt
 RenderDoc in-application API header  MIT       LICENSE-renderdoc-app.txt
 disruptorplus (Lewis Baker)          MIT (upstream: github.com/lewissbaker/disruptorplus)
 tiny-AES-c                           The Unlicense (public domain)
+
+Vulkan renderer (in rexruntime.dll / rexgpu-xenos.dll):
+volk                                 MIT       LICENSE-volk.txt
+Vulkan-Headers                       Apache 2.0 / MIT      LICENSE-Vulkan-Headers.txt
+Vulkan Memory Allocator              MIT       LICENSE-VulkanMemoryAllocator.txt
+SPIRV-Headers                        MIT-style (Khronos)   LICENSE-SPIRV-Headers.txt
+SPIRV-Tools                          Apache 2.0            LICENSE-SPIRV-Tools-Apache-2.0.txt
+glslang (SPIR-V code generation)     BSD 3-Clause and others (see file)
+                                               LICENSE-glslang.txt
 FFmpeg (audio decoding)              LGPL 2.1 or later     LICENSE-FFmpeg-LGPL-2.1.txt
 libmspack                            LGPL 2.1              LICENSE-libmspack-LGPL-2.1.txt
 

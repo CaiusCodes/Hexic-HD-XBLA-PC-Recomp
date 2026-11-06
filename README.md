@@ -13,21 +13,36 @@ data from it.
   time, it imports your package into `resources\assets`; saves, high scores and
   settings stay in `resources\userdata`. Nothing is installed elsewhere, no
   administrator rights or registry entries, and the folder can be moved or copied.
-- **Settings** in the main menu (in place of the Xbox-only Achievements viewer):
-  player name, windowed/fullscreen, resolution up to 3840 x 2160, render scale
-  (1x / 2x / 3x), VSync, an FPS counter and keyboard controls.
+- **Mouse, keyboard and controller**, switched on the fly. Point at a menu item to
+  highlight it and click to choose it (right click goes back); in a game the
+  highlighted pieces follow the pointer, left click rotates them clockwise and right
+  click counter-clockwise. Every controller input has a keyboard default (E rotates
+  clockwise, Q counter-clockwise, Esc pauses) and can be remapped. The game's
+  button icons turn into keycaps while you use the keyboard and mouse, and back
+  into controller buttons as soon as you pick up a pad.
+- **Settings** in the main menu (in place of the Xbox-only Achievements viewer),
+  in categories down the side: windowed/fullscreen, window size up to 3840 x 2160,
+  VSync and an FPS counter; render scale (1x / 2x / 3x), anti-aliasing (FXAA),
+  upscaling (AMD FSR 1) and renderer; your player name; keyboard controls; and
+  Check for Updates.
+- **Direct3D 12 or Vulkan.** Auto picks Direct3D 12 on NVIDIA and Vulkan on AMD and
+  Intel (as the GoldenEye and Perfect Dark ports do); either can be chosen in
+  Settings, and if the chosen one can't start the game uses the other.
 - **High Scores** that work offline: the game's own Leaderboards screen, renamed,
   shows your best Marathon, Timed and Survival scores from this PC under your
-  player name.
-- **Keyboard and controller** at the same time. Every controller input has a
-  keyboard default and can be remapped in Settings > Keyboard Controls.
+  player name. Its Marathon / Timed / Survival tabs can be clicked.
+- **Check for Updates** (Settings > Updates) asks this repository's GitHub releases
+  for a newer version, only when you press it. Update downloads the release,
+  checks its SHA-256, replaces the program files (never your saves, settings or
+  game data, and every file is put back if anything fails) and restarts the game.
 - **Light on the PC.** A steady 60 fps with even frame pacing; on the title screen
   the whole game uses about a third of one CPU core.
 - "Quit Hexic" returns to the desktop.
 
 ## Install and play
 
-1. Download the latest `Hexic-HD-PC-<version>.zip` from the Releases page.
+1. Download the latest `Hexic-HD-PC-v<version>.zip` from the Releases page (its
+   SHA-256 is in the `.sha256` file beside it).
 2. Extract the whole folder somewhere writable (not Program Files).
 3. Open `Hexic HD.exe`. If your package is beside it, in a `Game Package` folder
    next to it, or in an older release of this port nearby, it is found and imported
@@ -36,9 +51,13 @@ data from it.
 
 Setup opens your package read-only and only accepts the exact game build this port
 was recompiled from (it checks the SHA-256 of `default.xex`). The README inside the
-release covers controls, settings, updating from older releases and troubleshooting.
+release covers controls, settings, updating and troubleshooting.
 
-Requirements: Windows 10 or 11 (64-bit) and a DirectX 12 graphics card.
+To update later, use Settings > Updates > Check for Updates, or extract a newer
+release and open its `Hexic HD.exe` (it finds this one nearby and carries your
+saves, high scores and settings over).
+
+Requirements: Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan.
 
 ## Building from source
 
@@ -55,9 +74,11 @@ Requirements: Windows 10 or 11 (64-bit) and a DirectX 12 graphics card.
 ### 1. Build the ReXGlue SDK with this port's changes
 
 The port needs changes to ReXGlue v0.9.0 that are not upstream: the offline high
-scores, keyboard input, the player name, window and settings hooks, and timing, CPU
-and presentation fixes. They are in `sdk/rexglue-sdk-v0.9.0.patch` (56 files, applies
-to a clean v0.9.0) and contain no networking code. The patch also makes the SDK build
+scores, keyboard input and the input hooks the mouse support uses, the player name,
+window and settings hooks, timing, CPU and presentation fixes, the renderer choice,
+and fixes for a texture-cache race (dropped letters in menu text) and a hang on quit.
+They are in `sdk/rexglue-sdk-v0.9.0.patch` (62 files, applies to a clean v0.9.0) and
+contain no networking code. The patch also makes the SDK build
 libmspack from its real sources, because libmspack stores some files as symlinks that
 Git for Windows checks out as unusable text files unless symlinks are enabled; with
 the patch it does not matter what your git symlink setting is.
@@ -82,7 +103,7 @@ git apply path\to\hexic-hd-pc\sdk\rexglue-sdk-v0.9.0.patch
 ```
 
 ```bat
-cmake --preset win-amd64
+cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON
 cmake --build out/build/win-amd64 --config Release
 cmake --install out/build/win-amd64 --config Release --prefix C:\rexglue-sdk-install
 ```
@@ -102,11 +123,13 @@ built the SDK by hand and installed it elsewhere, add
 
 ### 3. Package a release
 
-`Make Release.bat` builds the game and runs `tools/Make-Release.ps1`, which builds the
-launcher (`packaging/Build-Launcher.ps1`), stages the portable folder in
-`out/release`, audits it (only `Hexic HD.exe`, `README.txt`, `licenses` and
-`resources` at the top, and no game data anywhere), writes `release-manifest.json`
-and creates the ZIP.
+The version is the `VERSION` file: the game, the launcher and the ZIP all take it
+from there. `Make Release.bat` builds the game and runs `tools/Make-Release.ps1`,
+which builds the launcher (`packaging/Build-Launcher.ps1`), stages the portable
+folder in `out/release`, audits it (only `Hexic HD.exe`, `README.txt`, `licenses` and
+`resources` at the top, and no game data anywhere) and creates
+`Hexic-HD-PC-v<version>.zip` with its `.sha256`. Publish both on a GitHub release
+tagged `v<version>`: Check for Updates looks for exactly that.
 
 ### Regenerating `generated/`
 

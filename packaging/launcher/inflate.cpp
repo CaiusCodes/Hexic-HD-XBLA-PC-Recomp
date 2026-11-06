@@ -241,6 +241,17 @@ uint32_t Adler32(const std::vector<uint8_t>& data) {
 
 }  // namespace
 
+bool InflateRaw(const uint8_t* data, size_t size, size_t expected, std::vector<uint8_t>* out) {
+  out->clear();
+  out->reserve(expected);
+  Decoder decoder(data, size, out);
+  if (!decoder.Run()) {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
 bool Inflate(const uint8_t* zlib_data, size_t size, std::vector<uint8_t>* out) {
   out->clear();
   if (size < 6) return false;

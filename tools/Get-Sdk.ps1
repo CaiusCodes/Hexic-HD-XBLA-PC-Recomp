@@ -126,7 +126,8 @@ if ($SkipBuild) {
 Push-Location $Destination
 try {
     Step 'Configuring the SDK'
-    Run 'cmake' @('--preset', 'win-amd64')
+    # Vulkan is off by default on Windows; the port offers it alongside Direct3D 12.
+    Run 'cmake' @('--preset', 'win-amd64', '-DREXGLUE_USE_VULKAN=ON')
     Step 'Building the SDK (Release) - this takes a while'
     Run 'cmake' @('--build', 'out/build/win-amd64', '--config', 'Release')
     # --config Release is required here: without it the install defaults to Debug and fails.

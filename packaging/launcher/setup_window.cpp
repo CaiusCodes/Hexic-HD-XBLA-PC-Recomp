@@ -59,6 +59,8 @@ enum class Mode { Idle, Choosing, Importing, Ready };
 constexpr UINT WM_APP_START = WM_APP + 1;
 constexpr UINT WM_APP_PROGRESS = WM_APP + 2;
 constexpr UINT WM_APP_DONE = WM_APP + 3;
+constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 4;
+constexpr UINT_PTR kRestartTimer = 1;  // update mode: the game starts again after a moment
 
 const wchar_t* const kClassName = L"HexicHDSetup";
 const wchar_t kDot[] = L"·";
@@ -170,7 +172,7 @@ std::unique_ptr<Font> MakePoints(const wchar_t* family, float points, int style)
 
 class SetupWindow {
  public:
-  SetupWindow(const Paths& p, const SetupOptions& o) : p_(p), options_(o) {}
+  SetupWindow(const Paths& p, const SetupOptions& o) : p_(p), options_(o), update_mode_(o.update) {}
   int Run(HINSTANCE instance);
 
  private:
@@ -198,6 +200,8 @@ class SetupWindow {
   void StartImport(Source source);  // by value: it may come from candidates_, which is cleared
   void OnProgress(ProgressMsg* msg);
   void OnDone(ImportResult* result);
+  void StartUpdate();
+  void OnUpdateDone(UpdateOutcome* outcome);
   void Play();
   void RequestClose();
   void Invalidate() { InvalidateRect(hwnd_, nullptr, FALSE); }
@@ -211,6 +215,12 @@ class SetupWindow {
   bool installed_ = false;
   bool imported_now_ = false;
   bool close_after_import_ = false;
+  // Update mode (--update): the same window shows the download and install.
+  bool update_mode_ = false;
+  int update_step_ = 0;  // 0 check, 1 download, 2 install (the step bar)
+  UpdateOutcome::Kind update_kind_ = UpdateOutcome::kFailed;
+  bool update_done_ = false;
+  std::wstring update_version_;
   std::vector<Source> candidates_;
   std::wstring heading_, hint_, path_text_, status_, phase_, stats_, detail_;
   uint32_t status_color_ = pal::Muted, phase_color_ = pal::Violet;
@@ -367,7 +377,7 @@ void SetupWindow::BuildBackdrop() {
   right.SetAlignment(StringAlignmentFar);
   SolidBrush tag_brush(Hex(0x3E3C5E));
   g.DrawString(L"XBLA PC PORT", -1, tag_.get(), RectF(420, 34, 226, 18), &right, &tag_brush);
-  const std::wstring setup_tag = std::wstring(L"SETUP  ") + kDot + L"  V" + kVersion;
+  const std::wstring setup_tag = std::wstring(update_mode_ ? L"UPDATE  " : L"SETUP  ") + kDot + L"  V" + kVersion;
   g.DrawString(setup_tag.c_str(), -1, tag_.get(), RectF(420, 52, 226, 18), &right, &tag_brush);
 
   // Dark card with a violet glow.
@@ -436,6 +446,8 @@ RectL SetupWindow::ControlRect(Control id) const {
 }
 
 bool SetupWindow::Enabled(Control id) const {
+  // Update mode shows no package field, no extras and no candidate rows.
+  if (update_mode_ && id != kLeft && id != kPlay) return false;
   switch (id) {
     case kBrowse: return mode_ != Mode::Importing && !imported_now_;
     case kLeft: return !(mode_ == Mode::Importing && cancel_.load());
@@ -557,25 +569,31 @@ void SetupWindow::Paint(HDC dc) {
 
     // Step bar. Done steps are lit cyan with a tick; the current one is white,
     // and Import lights up with the real progress; later steps stay dim.
-    const int stage = mode_ == Mode::Ready ? 2 : mode_ == Mode::Importing ? 1 : 0;
+    // Update mode: CHECK, DOWNLOAD (with its percentage), INSTALL; all lit
+    // once updated.
+    const bool updated = update_mode_ && update_done_ && update_kind_ == UpdateOutcome::kUpdated;
+    const bool all_done = update_mode_ ? updated : mode_ == Mode::Ready;
+    const int stage = update_mode_ ? update_step_ : mode_ == Mode::Ready ? 2 : mode_ == Mode::Importing ? 1 : 0;
     double lit = stage / 3.0;
-    if (mode_ == Mode::Ready) lit = 1.0;
-    else if (mode_ == Mode::Importing && show_bar_) lit += progress_ / 300.0;
+    if (all_done) lit = 1.0;
+    else if (mode_ == Mode::Importing && show_bar_ && (!update_mode_ || stage == 1)) lit += progress_ / 300.0;
     PaintGlow(g, kPill.x + 2, kPill.y + 2, kPill.w - 4, kPill.h - 4, lit);
-    const wchar_t* tabs[3] = {L"PACKAGE", L"IMPORT", L"PLAY"};
+    const wchar_t* setup_tabs[3] = {L"PACKAGE", L"IMPORT", L"PLAY"};
+    const wchar_t* update_tabs[3] = {L"CHECK", L"DOWNLOAD", L"INSTALL"};
+    const wchar_t* const* tabs = update_mode_ ? update_tabs : setup_tabs;
     const float segment = kPill.w / 3.0f;
     Pen divider(Hex(0xFFFFFF, 45), 1.0f);
     for (int i = 0; i < 3; ++i) {
       const float tx = kPill.x + i * segment;
       if (i > 0) g.DrawLine(&divider, tx, kPill.y + 7, tx, kPill.y + kPill.h - 7);
-      const bool done = i < stage || mode_ == Mode::Ready;
+      const bool done = i < stage || all_done;
       std::wstring label = tabs[i];
       uint32_t color = 0x6C6C96;
       if (done) {
         color = 0x04182C;
       } else if (i == stage) {
         color = 0xFFFFFF;
-        if (i == 1 && show_bar_) label = std::wstring(L"IMPORT  ") + kDot + L"  " + std::to_wstring(progress_) + L"%";
+        if (i == 1 && show_bar_) label = std::wstring(tabs[1]) + L"  " + kDot + L"  " + std::to_wstring(progress_) + L"%";
       }
       const RectF rect(tx, kPill.y, segment, kPill.h);
       if (i == stage && !done) {
@@ -594,9 +612,28 @@ void SetupWindow::Paint(HDC dc) {
     g.DrawLine(&under, kPill.x + 16, kPill.y + kPill.h - 1, kPill.x + kPill.w - 16, kPill.y + kPill.h - 1);
 
     // Title.
-    const wchar_t* title = mode_ == Mode::Ready ? L"Ready to play" : mode_ == Mode::Importing ? L"Importing your game" : L"Set up your game";
+    std::wstring title = mode_ == Mode::Ready ? L"Ready to play" : mode_ == Mode::Importing ? L"Importing your game" : L"Set up your game";
+    if (update_mode_) {
+      const std::wstring v = update_version_.empty() ? L"" : L"v" + update_version_;
+      if (!update_done_) {
+        title = update_step_ == 0 ? L"Updating Hexic HD" : L"Updating to " + v;
+      } else {
+        switch (update_kind_) {
+          case UpdateOutcome::kUpdated: title = L"Updated to " + v; break;
+          case UpdateOutcome::kUpToDate: title = L"Hexic HD is up to date"; break;
+          case UpdateOutcome::kCancelled: title = L"Update cancelled"; break;
+          default: title = L"The update did not complete"; break;
+        }
+      }
+    }
     PaintText(g, title, title_.get(), pal::Ink, RectF(98, 164, 420, 32));
 
+    if (update_mode_) {
+      // What happens, then the outcome in its colour (instead of the package field).
+      PaintText(g, L"UPDATE", caps_.get(), pal::Violet, RectF(98, 206, 300, 18));
+      PaintText(g, hint_, body_.get(), pal::Soft, RectF(98, 224, 524, 44), StringAlignmentNear, true);
+      PaintText(g, status_, small_.get(), status_color_, RectF(98, 272, 524, 52), StringAlignmentNear, true);
+    } else {
     // Package section.
     PaintText(g, L"GAME PACKAGE", caps_.get(), pal::Violet, RectF(98, 206, 300, 18));
     PaintText(g, mode_ == Mode::Choosing ? heading_ : hint_, body_.get(), pal::Soft, RectF(98, 224, 524, 22));
@@ -637,6 +674,7 @@ void SetupWindow::Paint(HDC dc) {
       PaintText(g, status_, small_.get(), status_color_, RectF(98, 294, 524, 34), StringAlignmentNear, true);
     }
     PaintButton(g, kBrowse, imported_now_ ? L"Imported" : L"Browse package" , Enabled(kBrowse), false, button_.get());
+    }  // package section
 
     // Progress: phase on the left, live counts on the right, a cyan bar.
     if (mode_ != Mode::Choosing) {
@@ -652,7 +690,9 @@ void SetupWindow::Paint(HDC dc) {
       PaintText(g, detail_, small_.get(), pal::Muted, RectF(98, 374, 524, 18));
     }
 
-    // Extras: a jewel checkbox, a title and a one-line explanation each.
+    // Extras: a jewel checkbox, a title and a one-line explanation each (not
+    // in update mode, which keeps what is set).
+    if (!update_mode_) {
     PaintText(g, std::wstring(L"OPTIONAL EXTRAS  ") + kDot + L"  APPLIED WHEN YOU PRESS PLAY", caps_.get(), pal::Violet,
               RectF(98, kExtrasY, 524, 18));
     Pen sep(Hex(pal::Violet, 60), 1.0f);
@@ -681,9 +721,10 @@ void SetupWindow::Paint(HDC dc) {
       PaintText(g, kExtraDefs[i].title, row_title_.get(), pal::Ink, RectF(132, y - 2, 490, 20));
       PaintText(g, kExtraDefs[i].detail, row_detail_.get(), pal::Muted, RectF(132, y + 17, 490, 18));
     }
+    }  // extras
 
     // A cleared flower: six jewels around a silver centre, once it is ready.
-    if (mode_ == Mode::Ready) {
+    if (update_mode_ ? updated : mode_ == Mode::Ready) {
       const double cx = 592, cy = 190, r = 13, step = std::sqrt(3.0) * r;
       for (int i = 0; i < 6; ++i) {
         const double a = 3.14159265358979323846 / 180 * (60 * i - 60);
@@ -693,7 +734,8 @@ void SetupWindow::Paint(HDC dc) {
     }
 
     // Footer and the two buttons.
-    PaintText(g, L"Title ID 584107D1", foot_.get(), pal::Muted, RectF(98, 524, 220, 18));
+    PaintText(g, update_mode_ ? std::wstring(L"This copy v") + kVersion : std::wstring(L"Title ID 584107D1"), foot_.get(),
+              pal::Muted, RectF(98, 524, 220, 18));
     const wchar_t* left = mode_ == Mode::Importing ? (cancel_.load() ? L"Cancelling" : L"Cancel") : L"Close";
     PaintButton(g, kLeft, left, Enabled(kLeft), false, button_.get());
     PaintButton(g, kPlay, L"PLAY", Enabled(kPlay), true, play_.get());
@@ -706,6 +748,10 @@ void SetupWindow::Paint(HDC dc) {
 
 // ---------------------------------------------------------------- flow --
 void SetupWindow::Start() {
+  if (update_mode_) {
+    StartUpdate();
+    return;
+  }
   hint_ = L"Drop the package file or its folder onto this window, or browse for it.";
   std::wstring missing;
   installed_ = IsInstalled(p_, &missing);
@@ -853,6 +899,11 @@ void SetupWindow::OnProgress(ProgressMsg* msg) {
     progress_ = std::clamp(msg->percent, 0, 100);
     phase_ = msg->phase;
     stats_ = msg->detail;
+    if (update_mode_) {
+      const bool installing = phase_ == L"CHECKING THE DOWNLOAD" || phase_ == L"UNPACKING" || phase_ == L"INSTALLING";
+      update_step_ = installing ? 2 : phase_ == L"DOWNLOADING" ? 1 : 0;
+      show_bar_ = update_step_ > 0;
+    }
     Invalidate();
   }
   delete msg;
@@ -894,7 +945,94 @@ void SetupWindow::OnDone(ImportResult* result) {
   if (close_after_import_) DestroyWindow(hwnd_);
 }
 
+// Update mode: the game closed itself to be updated; this downloads and
+// installs the latest release (RunUpdate) and then starts the game again.
+void SetupWindow::StartUpdate() {
+  if (worker_.joinable()) worker_.join();
+  mode_ = Mode::Importing;
+  heading_.clear();
+  hint_ = L"Only the program files change. Your saves, high scores, settings and imported game data are kept.";
+  status_.clear();
+  phase_ = L"WAITING FOR THE GAME TO CLOSE";
+  phase_color_ = pal::Violet;
+  stats_.clear();
+  detail_.clear();
+  progress_ = 0;
+  show_bar_ = false;
+  update_step_ = 0;
+  update_done_ = false;
+  cancel_ = false;
+  Invalidate();
+  HWND hwnd = hwnd_;
+  worker_ = std::thread([this, hwnd]() {
+    UpdateOutcome* outcome = new UpdateOutcome(
+        RunUpdate(p_, cancel_, [hwnd](int percent, const std::wstring& phase, const std::wstring& detail) {
+          PostMessageW(hwnd, WM_APP_PROGRESS, 0, reinterpret_cast<LPARAM>(new ProgressMsg{percent, phase, detail}));
+        }));
+    PostMessageW(hwnd, WM_APP_UPDATE_DONE, 0, reinterpret_cast<LPARAM>(outcome));
+  });
+}
+
+void SetupWindow::OnUpdateDone(UpdateOutcome* outcome) {
+  if (worker_.joinable()) worker_.join();
+  std::wstring missing;
+  installed_ = IsInstalled(p_, &missing);
+  mode_ = Mode::Ready;
+  update_done_ = true;
+  update_kind_ = outcome->kind;
+  if (!outcome->version.empty()) update_version_ = outcome->version;
+  stats_.clear();
+  switch (outcome->kind) {
+    case UpdateOutcome::kUpdated:
+      update_step_ = 3;
+      progress_ = 100;
+      show_bar_ = true;
+      phase_ = L"UPDATED TO V" + update_version_;
+      phase_color_ = pal::Ok;
+      status_ = L"Installed and verified. Your saves, high scores and settings were not touched.";
+      status_color_ = pal::Ok;
+      detail_ = std::wstring(L"Starting Hexic HD") + kEllipsis;
+      Log(L"Update window: updated to v" + update_version_ + L"; starting the game");
+      SetTimer(hwnd_, kRestartTimer, 1500, nullptr);
+      break;
+    case UpdateOutcome::kUpToDate:
+      show_bar_ = false;
+      phase_ = L"NO NEWER VERSION";
+      phase_color_ = pal::Ok;
+      status_ = std::wstring(L"You have the latest version (v") + kVersion + L"). Nothing was changed.";
+      status_color_ = pal::Ok;
+      detail_ = L"Press Play to start the game.";
+      break;
+    case UpdateOutcome::kCancelled:
+      show_bar_ = false;
+      phase_ = L"UPDATE CANCELLED";
+      phase_color_ = pal::Muted;
+      status_ = L"Nothing was changed.";
+      status_color_ = pal::Muted;
+      detail_ = L"Press Play to start the game as it was.";
+      break;
+    default:
+      show_bar_ = false;
+      phase_ = L"UPDATE DID NOT COMPLETE";
+      phase_color_ = pal::Bad;
+      status_ = outcome->message;
+      status_color_ = pal::Bad;
+      detail_ = L"Your saves and settings were not touched. Details: resources\\runtime\\logs\\setup.log";
+      break;
+  }
+  delete outcome;
+  cancel_ = false;
+  if ((update_kind_ == UpdateOutcome::kUpdated || update_kind_ == UpdateOutcome::kFailed) &&
+      GetForegroundWindow() != hwnd_) {
+    FLASHWINFO flash = {sizeof(flash), hwnd_, FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0};
+    FlashWindowEx(&flash);
+  }
+  Invalidate();
+  if (close_after_import_) DestroyWindow(hwnd_);
+}
+
 void SetupWindow::Play() {
+  KillTimer(hwnd_, kRestartTimer);
   const std::wstring note = ApplyExtras(p_, want_, was_, options_.shortcut_folder, [this](const fs::path& link) {
     const std::wstring text = L"There is already a Hexic HD shortcut on your desktop that opens a different copy:\n\n" +
                               link.wstring() + L"\n\nReplace it with one for this folder?";
@@ -970,6 +1108,14 @@ LRESULT SetupWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_START: Start(); return 0;
     case WM_APP_PROGRESS: OnProgress(reinterpret_cast<ProgressMsg*>(lp)); return 0;
     case WM_APP_DONE: OnDone(reinterpret_cast<ImportResult*>(lp)); return 0;
+    case WM_APP_UPDATE_DONE: OnUpdateDone(reinterpret_cast<UpdateOutcome*>(lp)); return 0;
+    case WM_TIMER:
+      if (wp == kRestartTimer) {
+        KillTimer(hwnd_, kRestartTimer);
+        if (Enabled(kPlay)) Play();
+        return 0;
+      }
+      break;
     case WM_MOUSEMOVE: {
       if (!tracking_) {
         TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, hwnd_, 0};
@@ -1055,7 +1201,8 @@ int SetupWindow::Run(HINSTANCE instance) {
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.lpszClassName = kClassName;
   RegisterClassExW(&wc);
-  hwnd_ = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, kClassName, L"Hexic HD Setup",
+  hwnd_ = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, kClassName,
+                          update_mode_ ? L"Hexic HD Update" : L"Hexic HD Setup",
                           WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX, 0, 0, 100, 100, nullptr, nullptr, instance, this);
   if (!hwnd_) return 1;
   // Explorer runs unelevated like us, but allow drops from it either way.
