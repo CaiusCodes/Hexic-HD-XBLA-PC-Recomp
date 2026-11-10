@@ -89,6 +89,51 @@ class Sha256 {
   BCRYPT_HASH_HANDLE hash_ = nullptr;
 };
 
+// The version a default.xex reports in its execution info header (0x00040006):
+// e.g. "2.0.1884.0". Empty if the header is missing or the bytes are too short.
+// Only used to tell a player which build they have; the SHA-256 decides.
+constexpr const wchar_t* kXexVersion = L"2.0.1884.0";
+
+std::wstring XexVersion(const std::vector<uint8_t>& x) {
+  if (x.size() < 0x18 || memcmp(x.data(), "XEX2", 4) != 0) return {};
+  const uint32_t count = BE32(&x[0x14]);
+  for (uint32_t i = 0; i < count && i < 64; ++i) {
+    const size_t at = 0x18 + size_t(i) * 8;
+    if (at + 8 > x.size()) return {};
+    if (BE32(&x[at]) != 0x00040006) continue;
+    const size_t info = BE32(&x[at + 4]);
+    if (info + 8 > x.size()) return {};
+    const uint32_t v = BE32(&x[info + 4]);
+    wchar_t text[48];
+    swprintf(text, 48, L"%u.%u.%u.%u", v >> 28, (v >> 24) & 0xF, (v >> 8) & 0xFFFF, v & 0xFF);
+    return text;
+  }
+  return {};
+}
+
+std::vector<uint8_t> ReadPrefix(const fs::path& path, size_t size) {
+  std::vector<uint8_t> data(size);
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return {};
+  DWORD got = 0;
+  if (!ReadFile(file, data.data(), static_cast<DWORD>(size), &got, nullptr)) got = 0;
+  CloseHandle(file);
+  data.resize(got);
+  return data;
+}
+
+// What a player is told when their game program is not the build this port
+// was made from.
+std::wstring WrongBuildMessage(const std::wstring& found, const wchar_t* where) {
+  // Kept to two lines of the setup window's status text.
+  if (found == kXexVersion)
+    return std::wstring(where) + L" holds a modified or damaged copy of Hexic HD " + found +
+           L". Copy it from your Xbox 360 again. Nothing was changed.";
+  std::wstring text = std::wstring(where) + L" holds ";
+  text += found.empty() ? L"a different build of Hexic HD" : L"Hexic HD version " + found;
+  return text + L", but this port needs " + kXexVersion + L" (the Xbox Live Arcade release). Nothing was changed.";
+}
+
 std::string HashFile(const fs::path& path) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -701,13 +746,19 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
         return fail(L"This package does not contain " + std::wstring(name) + L". It may be damaged or incomplete.");
     }
     Sha256 sha;
-    if (!package->Read(*package->Find(L"default.xex"), [&](const uint8_t* d, size_t n) { sha.Add(d, n); return true; }, &why))
+    std::vector<uint8_t> head;  // the first 64 KB, for the version in its header
+    if (!package->Read(*package->Find(L"default.xex"),
+                       [&](const uint8_t* d, size_t n) {
+                         sha.Add(d, n);
+                         if (head.size() < 0x10000) head.insert(head.end(), d, d + (std::min)(n, 0x10000 - head.size()));
+                         return true;
+                       },
+                       &why))
       return fail(why);
     const std::string hash = sha.Hex();
-    Log(L"default.xex SHA-256 " + Widen(hash));
-    if (hash != kXexSha256)
-      return fail(L"This Hexic HD package carries a different build of the game program than the one this port "
-                  L"was made from, so it cannot be used. Nothing was changed.");
+    const std::wstring version = XexVersion(head);
+    Log(L"default.xex SHA-256 " + Widen(hash) + L", version " + (version.empty() ? L"unknown" : version));
+    if (hash != kXexSha256) return fail(WrongBuildMessage(version, L"This package"));
     total = package->total_file_bytes();
     for (const stfs::Entry& e : package->entries()) total_files += e.directory ? 0 : 1;
   } else {
@@ -716,9 +767,9 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
         return fail(L"The previous install is missing " + std::wstring(name) + L". Choose your Xbox 360 package instead.");
     }
     const std::string hash = HashFile(previous_assets / L"default.xex");
-    Log(L"previous default.xex SHA-256 " + Widen(hash));
-    if (hash != kXexSha256)
-      return fail(L"The previous install holds a different build of the game program. Choose your Xbox 360 package instead.");
+    const std::wstring version = XexVersion(ReadPrefix(previous_assets / L"default.xex", 0x10000));
+    Log(L"previous default.xex SHA-256 " + Widen(hash) + L", version " + (version.empty() ? L"unknown" : version));
+    if (hash != kXexSha256) return fail(WrongBuildMessage(version, L"The previous install"));
     for (fs::recursive_directory_iterator it(previous_assets, fs::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
       std::error_code type_ec;

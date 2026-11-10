@@ -229,8 +229,10 @@ again afterwards.
 
 If setup rejects your package, the reason is shown in the window and in
 resources\runtime\logs\setup.log. Choose the Hexic HD game package itself, not
-a title update, save or theme. When reporting a problem, include the newest
-files from resources\runtime\logs.
+a title update, save or theme. The port is made from one build of the game,
+version 2.0.1884.0 (the Xbox Live Arcade release); a package holding any other
+build, or a modified copy, is refused. When reporting a problem, include the
+newest files from resources\runtime\logs.
 
 LEGAL
 -----
