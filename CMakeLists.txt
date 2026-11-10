@@ -26,6 +26,16 @@ endif()
 
 rexglue_setup_target(hexic_hd GPU_PLUGINS xenos)
 
+# No build-machine paths in the program: assert and log messages carry
+# __FILE__, which would otherwise hold the full path this was built in (the
+# builder's user name and folders). The folder above this repository (which
+# also holds the SDK checkout) becomes "", leaving "hexic-hd-recomp/src/...".
+get_filename_component(HEXIC_PATH_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+file(TO_NATIVE_PATH "${HEXIC_PATH_PREFIX}" HEXIC_PATH_PREFIX_NATIVE)
+target_compile_options(hexic_hd PRIVATE
+    "-ffile-prefix-map=${HEXIC_PATH_PREFIX}/="
+    "-ffile-prefix-map=${HEXIC_PATH_PREFIX_NATIVE}\\=")
+
 if(WIN32)
     # Direct XInput polling for the Settings panel's controller navigation;
     # WinHTTP and CNG (SHA-256) for Settings > Updates (src/hexic_update.h).

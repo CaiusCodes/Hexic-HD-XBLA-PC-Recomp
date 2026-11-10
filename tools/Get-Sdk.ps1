@@ -127,7 +127,12 @@ Push-Location $Destination
 try {
     Step 'Configuring the SDK'
     # Vulkan is off by default on Windows; the port offers it alongside Direct3D 12.
-    Run 'cmake' @('--preset', 'win-amd64', '-DREXGLUE_USE_VULKAN=ON')
+    # The DLLs carry __FILE__ in assert and log messages: -ffile-prefix-map turns
+    # the build path (the builder's user name and folders) into a relative one.
+    # -march=x86-64-v3 is the preset's own flag, repeated because -D replaces it.
+    $parent = (Split-Path -Parent (Resolve-Path $Destination).Path)
+    $prefix = "-march=x86-64-v3 -ffile-prefix-map=$($parent.Replace('\', '/'))/= -ffile-prefix-map=$parent\="
+    Run 'cmake' @('--preset', 'win-amd64', '-DREXGLUE_USE_VULKAN=ON', "-DCMAKE_C_FLAGS=$prefix", "-DCMAKE_CXX_FLAGS=$prefix")
     Step 'Building the SDK (Release) - this takes a while'
     Run 'cmake' @('--build', 'out/build/win-amd64', '--config', 'Release')
     # --config Release is required here: without it the install defaults to Debug and fails.
