@@ -58,7 +58,8 @@ To update later, use Settings > Updates > Check for Updates, or extract a newer
 release and open its `Hexic HD.exe` (it finds this one nearby and carries your
 saves, high scores and settings over).
 
-Requirements: Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan.
+Requirements: Windows 10 or 11 (64-bit), a CPU from 2015 onwards (it needs AVX2),
+and a graphics card with DirectX 12 or Vulkan.
 
 ## Building from source
 

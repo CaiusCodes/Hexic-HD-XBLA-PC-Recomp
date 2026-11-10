@@ -20,7 +20,9 @@ that it is the supported version and imports the game data from it into this
 folder. After that the package is not needed any more.
 
 Requirements:
-  Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan.
+  Windows 10 or 11 (64-bit), a processor from 2015 onwards (the game needs
+  AVX2; older processors cannot start it), and a graphics card with
+  DirectX 12 or Vulkan.
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
 
