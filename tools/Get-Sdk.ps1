@@ -110,7 +110,9 @@ Invoke-Git -C $Destination apply --check $patch
 Invoke-Git -C $Destination apply $patch
 # Commit it on a branch, so the SDK folder is a normal repository and the patch can be
 # regenerated with: git diff v0.9.0 hexic-minimal -- src include thirdparty/CMakeLists.txt
-Invoke-Git -C $Destination switch -c hexic-minimal
+# -C, not -c: a clone of a local SDK checkout (-Source <folder>) already has a
+# hexic-minimal branch; this fresh clone's copy is replaced, at the pinned commit.
+Invoke-Git -C $Destination switch -C hexic-minimal
 Invoke-Git -C $Destination add -- src include thirdparty/CMakeLists.txt
 Invoke-Git -C $Destination -c user.name='Hexic HD PC contributors' -c user.email='' commit -q -m 'Hexic HD SDK changes (sdk/rexglue-sdk-v0.9.0.patch applied to v0.9.0)'
 $changed = @(& git -C $Destination diff --name-only $Tag HEAD).Count
