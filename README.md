@@ -1,186 +1,157 @@
-# Hexic HD PC
+# Hexic HD XBLA PC Recomp
 
-A native Windows port of the Xbox 360 (Xbox LIVE Arcade) release of **Hexic HD**,
-built with the [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompiler.
+A native Windows PC port of **Hexic HD**, the Xbox 360 launch puzzle game by Carbonated
+Games, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation.
 
-**No game files are included.** You need your own legally obtained Xbox 360 Hexic HD
-package (title ID `584107D1`). The first time you open the game it imports the game
-data from it.
+Play at **up to 4K and a steady 60 FPS**, with full mouse, keyboard and controller support
+that switches on the fly, offline High Scores and a native PC settings menu. No emulator
+required.
+
+**Free and open-source.**
+
+Like the recomp and want to support future projects? You can tip me on
+[Ko-fi](https://ko-fi.com/caiuscodes).
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+
+![Hexic HD Main Menu](docs/screenshots/04-main-menu.png)
+
+> **You must provide your own copy of Hexic HD XBLA.** No original game files or assets
+> are distributed with this project. The launcher imports the required files from your
+> Xbox 360 game package during first-time setup.
+
+## Download & Installation
+
+**[Download the latest release](https://github.com/CaiusCodes/Hexic-HD-XBLA-PC-Recomp/releases)**
+
+1. Download the latest ZIP and extract the **Hexic HD PC** folder somewhere writable (not
+   Program Files).
+2. Run `Hexic HD.exe`.
+3. Select your Hexic HD XBLA package using **Browse package**, drag it onto the window, or
+   place it alongside the executable (or in a `Game Package` folder) for automatic
+   detection.
+4. Choose your options: fullscreen, desktop shortcut, and an optional folder of your own
+   for saves and settings.
+5. Click **Play**.
+
+![Setup window](docs/screenshots/02-setup-ready.png)
+
+After setup, simply run `Hexic HD.exe` to play. Your original game package is no longer
+needed.
+
+**To reopen setup:** run `Hexic HD.exe --setup`.
+
+The installation is portable, with imported game files, saves and settings stored inside
+the game folder.
+
+### System Requirements
+
+- Windows 10 or 11 (64-bit)
+- A processor from 2015 onwards (AVX2)
+- DirectX 12 or Vulkan-compatible graphics card
+- Your own Hexic HD XBLA package (Title ID `584107D1`, version 2.0.1884.0)
 
 ## Features
 
-- **Portable, one program.** Extract the release and open `Hexic HD.exe`. The first
-  time, it imports your package into `resources\assets`; saves, high scores and
-  settings stay in `resources\userdata`, or in a folder of your choice (an
-  optional setup extra). Nothing is installed elsewhere, no administrator rights or
-  registry entries, and the folder can be moved or copied.
-- **Mouse, keyboard and controller**, switched on the fly. Point at a menu item to
-  highlight it and click to choose it (right click goes back); in a game the
-  highlighted pieces follow the pointer, left click rotates them clockwise and right
-  click counter-clockwise. Every controller input has a keyboard default (E rotates
-  clockwise, Q counter-clockwise, Esc pauses) and can be remapped. The game's
-  button icons turn into keycaps while you use the keyboard and mouse, and back
-  into controller buttons as soon as you pick up a pad.
-- **Settings** in the main menu (in place of the Xbox-only Achievements viewer),
-  in categories down the side: windowed/fullscreen, window size up to 3840 x 2160,
-  VSync and an FPS counter; render scale (1x / 2x / 3x), anti-aliasing (FXAA),
-  upscaling (AMD FSR 1) and renderer; your player name; keyboard controls; and
-  Check for Updates.
-- **Direct3D 12 or Vulkan.** Auto picks Direct3D 12 on NVIDIA and Vulkan on AMD and
-  Intel (as the GoldenEye and Perfect Dark ports do); either can be chosen in
-  Settings, and if the chosen one can't start the game uses the other.
-- **High Scores** that work offline: the game's own Leaderboards screen, renamed,
-  shows your best Marathon, Timed and Survival scores from this PC under your
-  player name. Its Marathon / Timed / Survival tabs can be clicked.
-- **Check for Updates** (Settings > Updates) asks this repository's GitHub releases
-  for a newer version, only when you press it. Update downloads the release,
-  checks its SHA-256, replaces the program files (never your saves, settings or
-  game data, and every file is put back if anything fails) and restarts the game.
-- **Light on the PC.** A steady 60 fps with even frame pacing; on the title screen
-  the whole game uses about a third of one CPU core.
-- "Quit Hexic" returns to the desktop.
+### Graphics & Performance
 
-## Install and play
+- **Native PC rendering:** Direct3D 12 or Vulkan, with automatic fallback to the other
+- **Up to 4K** with fullscreen and windowed modes
+- **Steady 60 FPS** with even frame pacing, V-Sync and an optional FPS counter
+- **Render Scale:** 1x, 2x or 3x
+- **AMD FSR** upscaling and **FXAA** anti-aliasing
+- **Light on the PC:** about a third of one CPU core on the menus
 
-1. Download the latest `Hexic-HD-PC-v<version>.zip` from the Releases page (its
-   SHA-256 is in the `.sha256` file beside it).
-2. Extract the whole folder somewhere writable (not Program Files).
-3. Open `Hexic HD.exe`. If your package is beside it, in a `Game Package` folder
-   next to it, or in an older release of this port nearby, it is found and imported
-   automatically; otherwise drag it onto the window or click **Browse package**.
-4. Click **PLAY**. From then on, `Hexic HD.exe` starts the game straight away.
+![Hexic HD Marathon gameplay](docs/screenshots/06-marathon.png)
 
-Setup opens your package read-only and only accepts the exact game build this port
-was recompiled from (it checks the SHA-256 of `default.xex`). The README inside the
-release covers controls, settings, updating and troubleshooting.
+### Controls & Quality of Life
 
-To update later, use Settings > Updates > Check for Updates, or extract a newer
-release and open its `Hexic HD.exe` (it finds this one nearby and carries your
-saves, high scores and settings over).
+- **Mouse support:** point at a menu item and click it; in a game, the highlighted pieces
+  follow the pointer and the mouse buttons rotate them
+- Full **keyboard** support with rebindable keys
+- **Xbox controller** support
+- **Hot-swapping:** button prompts switch between keycaps and controller buttons as soon as
+  you change device
+- Native PC **Settings** menu in place of the Xbox-only Achievements viewer
+- Player name of your choice, shown on High Scores
+- Built-in update checker
+- Portable installation with local saves and settings, or a saves folder of your choice
 
-Requirements: Windows 10 or 11 (64-bit), a CPU from 2015 onwards (it needs AVX2),
-and a graphics card with DirectX 12 or Vulkan.
+![Settings](docs/screenshots/09-settings.png)
 
-## Building from source
+### High Scores
 
-### Prerequisites
+The game's Xbox LIVE Leaderboards screen works offline as **High Scores**, keeping your best
+Marathon, Timed and Survival scores on this PC.
 
-- Windows 10 or 11 (64-bit)
-- [LLVM](https://github.com/llvm/llvm-project/releases) (clang, clang-cl and llvm-rc,
-  installed to `C:\Program Files\LLVM`)
-- [CMake](https://cmake.org/) 3.25 or newer and [Ninja](https://ninja-build.org/)
-- Visual Studio 2022 or newer with the C++ workload (Windows SDK and the Visual C++
-  runtime DLLs that the release ships)
-- Git
+![High Scores](docs/screenshots/08-high-scores.png)
 
-### 1. Build the ReXGlue SDK with this port's changes
+## Keyboard & Mouse Controls
 
-The port needs changes to ReXGlue v0.9.0 that are not upstream: the offline high
-scores, keyboard input and the input hooks the mouse support uses, the player name,
-window and settings hooks, timing, CPU and presentation fixes, the renderer choice,
-and fixes for a texture-cache race (dropped letters in menu text) and a hang on quit.
-They are in `sdk/rexglue-sdk-v0.9.0.patch` (62 files, applies to a clean v0.9.0) and
-contain no networking code. The patch also makes the SDK build
-libmspack from its real sources, because libmspack stores some files as symlinks that
-Git for Windows checks out as unusable text files unless symlinks are enabled; with
-the patch it does not matter what your git symlink setting is.
+| Key | Action |
+|---|---|
+| Mouse | Highlight pieces / menu items |
+| Left Click, E, Space, Enter | Rotate clockwise / Select |
+| Right Click, Q | Rotate counter-clockwise (in a game) / Back (in menus) |
+| Arrow Keys, W A S D | Move |
+| Backspace | Back |
+| Esc | Pause |
 
-**The easy way.** One command clones ReXGlue at v0.9.0, applies the patch, then builds
-and installs the SDK into `..\rexglue-sdk`, where the
-game's CMake presets look for it. It never replaces anything that already exists:
+Keys can be customised under **Settings → Controls**.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\Get-Sdk.ps1
-```
+Xbox controllers use the original console controls.
 
-(`-Destination <folder>` puts the SDK somewhere else; `-SkipBuild` stops after the
-patch.) Or do the same by hand:
+## Updates
 
-```bat
-git clone https://github.com/rexglue/rexglue-sdk.git
-cd rexglue-sdk
-git checkout v0.9.0
-git submodule update --init --recursive
-git apply path\to\hexic-hd-pc\sdk\rexglue-sdk-v0.9.0.patch
-```
+Check for new versions through **Settings → Updates → Check for Updates**.
 
-```bat
-cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON
-cmake --build out/build/win-amd64 --config Release
-cmake --install out/build/win-amd64 --config Release --prefix C:\rexglue-sdk-install
-```
+Updates are downloaded, checked and installed without affecting your imported game files,
+saves or settings.
 
-### 2. Build the game
+Alternatively, download the latest release ZIP and extract it next to your existing
+installation: setup imports straight from the old one, carrying your saves and settings
+with it. Older installations using a separate Setup and `Game` folder can also be imported.
 
-```bat
-cd path\to\hexic-hd-pc
-cmake --preset win-amd64-release
-cmake --build out/build/win-amd64-release --target hexic_hd
-```
+## Known Limitations
 
-The presets look for the SDK in `..\rexglue-sdk\out\install\win-amd64`, which is
-where `tools\Get-Sdk.ps1` puts it, and will not fall back to any other install. If you
-built the SDK by hand and installed it elsewhere, add
-`-DCMAKE_PREFIX_PATH=C:\rexglue-sdk-install` (your install folder) to the first command.
+- Windows only.
+- Only the supported Hexic HD XBLA build (Title ID `584107D1`, version 2.0.1884.0) is
+  accepted.
+- The player name can only be typed on a keyboard.
+- Windows SmartScreen may warn about the unsigned executable.
 
-### 3. Package a release
+## Reporting Issues
 
-The version is the `VERSION` file: the game, the launcher and the ZIP all take it
-from there. `Make Release.bat` builds the game and runs `tools/Make-Release.ps1`,
-which builds the launcher (`packaging/Build-Launcher.ps1`), stages the portable
-folder in `out/release`, audits it (only `Hexic HD.exe`, `README.txt`, `licenses` and
-`resources` at the top, and no game data anywhere) and creates
-`Hexic-HD-PC-v<version>.zip` with its `.sha256`. Publish both on a GitHub release
-tagged `v<version>`: Check for Updates looks for exactly that.
+Found a bug? [Open a GitHub Issue](https://github.com/CaiusCodes/Hexic-HD-XBLA-PC-Recomp/issues)
+and include your latest log from:
 
-### Regenerating `generated/`
+`resources\runtime\logs\`
 
-`generated/` is the C++ that ReXGlue's recompiler produced from the game's
-`default.xex`, so a normal build doesn't need the game. To regenerate it, extract
-your package to `../hexic_hd_extracted` (next to this repository) and run:
+For setup problems, include `setup.log` from the same folder.
 
-```bat
-rexglue codegen hexic_hd_manifest.toml
-```
+## Building from Source
 
-Two functions in `generated/` carry small hand edits, marked `Hexic hand edit`
-(`hexic_hd_recomp.2.cpp`: the GPU-wait backoff; `hexic_hd_recomp.11.cpp`: the
-frame-timing log). Re-apply them after regenerating.
+See [docs/BUILDING.md](docs/BUILDING.md).
 
-## Repository layout
+## Development & Credits
 
-| Path | Contents |
-| --- | --- |
-| `src/` | The PC app: paths, fonts, Settings panel, timing hooks, Xbox LIVE sign-in shim |
-| `generated/` | Recompiled game code (ReXGlue codegen output) |
-| `packaging/launcher/` | `Hexic HD.exe`: the launcher and setup window (native C++) |
-| `packaging/` | Launcher build script, player README, licenses; `legacy-setup/` holds the older Setup and play launchers |
-| `tools/` | SDK setup script (`Get-Sdk.ps1`), release builder and STFS extractor |
-| `sdk/` | Patch for ReXGlue v0.9.0 |
+This project builds upon the work of:
 
-## Legal
-
-Hexic HD, Xbox, Xbox 360 and related names and marks belong to their respective
-owners. This project is not affiliated with or endorsed by Microsoft or Carbonated
-Games. It contains no game assets; please don't share a release folder once it has
-imported your package (`resources\assets`).
-
-## License
-
-The original code in this repository (`src/`, `packaging/`, `tools/`) is released
-under the [MIT License](LICENSE), except the launcher in `packaging/launcher/`, whose
-package reader is derived from [Velocity](https://github.com/hetelek/Velocity) and
-which is therefore licensed under the GNU GPL version 3
-(`packaging/licenses/LICENSE-Extract-STFS.txt`). The SDK patch modifies
-ReXGlue, which is BSD 3-Clause licensed; those changes are offered under the same
-terms. The MIT license does not cover `generated/`, which is machine-translated from
-the game program, or the game itself.
-
-## Credits
-
-- [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and contributors,
-  which includes code derived from the [Xenia](https://xenia.jp/) project
-- [Velocity](https://github.com/hetelek/Velocity), whose STFS handling the package
-  reader is derived from
+- [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and contributors – Static
+  recompilation framework, including code derived from the [Xenia](https://xenia.jp/)
+  project.
+- [Velocity](https://github.com/hetelek/Velocity) – Xbox 360 package handling, from which
+  the launcher's package reader is derived.
 - SDL, Dear ImGui, FFmpeg and the other open-source components listed in
-  `packaging/licenses`
+  [packaging/licenses](packaging/licenses).
+
+The project's own code is released under the [MIT License](LICENSE). The launcher includes
+GPL-3.0 components derived from [Velocity](https://github.com/hetelek/Velocity), and
+third-party dependencies retain their respective licences. The MIT License does not cover
+`generated/`, which is machine-translated from the game program, or the game itself.
+
+---
+
+*Hexic HD and Xbox are trademarks or property of their respective owners. This is an
+independent fan project and is not affiliated with or endorsed by Microsoft or Carbonated
+Games.*
