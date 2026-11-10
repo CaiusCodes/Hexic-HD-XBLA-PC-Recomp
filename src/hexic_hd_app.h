@@ -21,6 +21,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -79,8 +80,26 @@ inline std::filesystem::path DataRoot() {
   const auto exe = ExeFolder();
   return InRuntimeFolder() ? exe.parent_path() : exe;
 }
+// Saves, high scores, settings and caches: resources\userdata, unless the
+// player chose another folder in setup. Then resources\userdata-location.txt
+// holds that folder (one line, UTF-8); the launcher writes it, and an update
+// never touches it (only the program files are replaced).
+inline std::filesystem::path CustomUserDataRoot() {
+  if (!InRuntimeFolder()) return {};
+  std::ifstream in(DataRoot() / "userdata-location.txt", std::ios::binary);
+  std::string line;
+  if (!in || !std::getline(in, line)) return {};
+  if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF) line.erase(0, 3);  // BOM
+  while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+  if (line.empty()) return {};
+  return std::filesystem::path(std::u8string(line.begin(), line.end()));
+}
+inline std::filesystem::path UserDataRoot() {
+  const auto custom = CustomUserDataRoot();
+  return custom.empty() ? DataRoot() / "userdata" : custom;
+}
 inline std::filesystem::path ConfigPath() {
-  return InRuntimeFolder() ? DataRoot() / "userdata" / "hexic_hd.toml" : ExeFolder() / "hexic_hd.toml";
+  return InRuntimeFolder() ? UserDataRoot() / "hexic_hd.toml" : ExeFolder() / "hexic_hd.toml";
 }
 }  // namespace hexic_paths
 
@@ -844,7 +863,19 @@ class HexicHdApp : public rex::ReXApp {
 
     paths.game_data_root = assets_path;
 
-    const auto user_data_path = data_root / "userdata";
+    const auto custom = hexic_paths::CustomUserDataRoot();
+    std::error_code ec;
+    if (!custom.empty() && !std::filesystem::is_directory(custom, ec)) {
+      // A chosen saves folder that is gone (a drive not connected, say): never
+      // start with empty saves in its place.
+      const std::wstring text = L"Hexic HD can't find your saves and settings folder:\n\n" +
+                                custom.wstring() +
+                                L"\n\nConnect the drive it is on, or open \"Hexic HD.exe\" with "
+                                L"--setup to choose another folder.";
+      MessageBoxW(nullptr, text.c_str(), L"Hexic HD", MB_OK | MB_ICONERROR);
+      ExitProcess(1);
+    }
+    const auto user_data_path = hexic_paths::UserDataRoot();
     paths.user_data_root = user_data_path;
     paths.cache_root = user_data_path / "cache";
     paths.config_path = hexic_paths::ConfigPath();

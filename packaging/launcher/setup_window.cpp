@@ -36,23 +36,24 @@ namespace {
 using namespace Gdiplus;
 
 // ------------------------------------------------------------- layout --
-constexpr float kW = 720, kH = 600;
+constexpr float kW = 720, kH = 646;
 constexpr float kUiScale = 1.0f;
 
 struct Box {
   float x, y, w, h, r;
 };
-constexpr Box kBezel = {44, 12, 632, 576, 34};
-constexpr Box kCard = {62, 92, 596, 480, 28};
+constexpr Box kBezel = {44, 12, 632, 622, 34};
+constexpr Box kCard = {62, 92, 596, 526, 28};
 constexpr Box kPill = {90, 109, 540, 28, 14};
-constexpr Box kPanel = {74, 152, 572, 408, 20};
+constexpr Box kPanel = {74, 152, 572, 454, 20};
 constexpr Box kField = {98, 252, 380, 34, 7};
 constexpr Box kBar = {98, 356, 524, 12, 6};
 constexpr float kRowsY = 250, kRowPitch = 30;  // candidate rows when several packages are found
 constexpr int kMaxRows = 4;
 constexpr float kExtrasY = 402, kExtraFirst = 426, kExtraPitch = 42;
+constexpr float kSavesY = kExtraFirst + 2 * kExtraPitch;  // the saves-folder row, after the two extras
 
-enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kRow0 };
+enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSaves, kSavesBrowse, kRow0 };
 
 enum class Mode { Idle, Choosing, Importing, Ready };
 
@@ -196,6 +197,7 @@ class SetupWindow {
 
   void Start();
   void Browse();
+  void ChooseSavesFolder();
   void SelectPath(const fs::path& path);
   void StartImport(Source source);  // by value: it may come from candidates_, which is cleared
   void OnProgress(ProgressMsg* msg);
@@ -206,7 +208,7 @@ class SetupWindow {
   void RequestClose();
   void Invalidate() { InvalidateRect(hwnd_, nullptr, FALSE); }
 
-  const Paths& p_;
+  Paths p_;  // a copy: the saves folder can change (SetUserDataLocation)
   SetupOptions options_;
   HWND hwnd_ = nullptr;
   HICON icon_ = nullptr;
@@ -228,6 +230,8 @@ class SetupWindow {
   int progress_ = 0;
   bool show_bar_ = false;
   Extras want_, was_;
+  // The saves folder (empty: resources\userdata), applied on Play like the extras.
+  fs::path want_saves_, was_saves_;
   Control hover_ = kNone, pressed_ = kNone;
   bool tracking_ = false;
   std::atomic<bool> cancel_{false};
@@ -344,7 +348,7 @@ void SetupWindow::BuildBackdrop() {
   // Slate hexagons scattered down both sides of the black field.
   const double r = 21.0;
   const double step_x = std::sqrt(3.0) * r;
-  for (int row = 0; row < 20; ++row) {
+  for (int row = 0; row < 22; ++row) {
     for (int col = 0; col < 21; ++col) {
       const double cx = col * step_x + (row % 2 ? step_x / 2 : 0) - 12;
       const double cy = row * 1.5 * r - 8;
@@ -434,8 +438,10 @@ void SetupWindow::BuildBackdrop() {
 RectL SetupWindow::ControlRect(Control id) const {
   switch (id) {
     case kBrowse: return {490, 252, 132, 34};
-    case kLeft: return {352, 510, 112, 40};
-    case kPlay: return {476, 506, 146, 46};
+    case kLeft: return {352, 556, 112, 40};
+    case kPlay: return {476, 552, 146, 46};
+    case kSaves: return {98, kSavesY - 6, 524, kExtraPitch - 2};
+    case kSavesBrowse: return {500, kSavesY - 1, 122, 30};
     case kExtra0:
     case kExtra1: return {98, kExtraFirst + (id - kExtra0) * kExtraPitch - 6, 524, kExtraPitch - 2};
     default: {
@@ -452,6 +458,8 @@ bool SetupWindow::Enabled(Control id) const {
     case kBrowse: return mode_ != Mode::Importing && !imported_now_;
     case kLeft: return !(mode_ == Mode::Importing && cancel_.load());
     case kPlay: return mode_ == Mode::Ready && installed_;
+    case kSaves:
+    case kSavesBrowse: return mode_ != Mode::Importing;
     case kExtra0:
     case kExtra1: return true;
     default: return mode_ == Mode::Choosing && id - kRow0 < static_cast<int>(candidates_.size());
@@ -459,7 +467,7 @@ bool SetupWindow::Enabled(Control id) const {
 }
 
 Control SetupWindow::HitTest(float x, float y) const {
-  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1};
+  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSavesBrowse, kSaves};
   if (mode_ == Mode::Choosing) {
     for (int i = 0; i < static_cast<int>(candidates_.size()) && i < kMaxRows; ++i)
       ids.push_back(static_cast<Control>(kRow0 + i));
@@ -721,6 +729,34 @@ void SetupWindow::Paint(HDC dc) {
       PaintText(g, kExtraDefs[i].title, row_title_.get(), pal::Ink, RectF(132, y - 2, 490, 20));
       PaintText(g, kExtraDefs[i].detail, row_detail_.get(), pal::Muted, RectF(132, y + 17, 490, 18));
     }
+    // Saves and settings folder: off = this folder; on = the chosen one.
+    {
+      const float y = kSavesY;
+      if (hover_ == kSaves) {
+        const RectL r = ControlRect(kSaves);
+        GraphicsPath row;
+        RoundedPath(row, r.x, r.y, r.w, r.h, 8);
+        SolidBrush hover(Hex(0x5B3FD6, 28));
+        g.FillPath(&hover, &row);
+      }
+      const bool custom = !want_saves_.empty();
+      if (custom) {
+        PaintJewel(g, 110, y + 13, 12, pal::Jewels[3]);
+        DrawTick(g, 110, y + 13, 13, Hex(0xFFFFFF), 2.4f);
+      } else {
+        GraphicsPath hex;
+        HexPath(hex, 110, y + 13, 12);
+        SolidBrush white(Hex(0xFFFFFF, 235));
+        g.FillPath(&white, &hex);
+        Pen edge(Hex(pal::Violet, 200), 1.4f);
+        g.DrawPath(&edge, &hex);
+      }
+      PaintText(g, L"Keep saves and settings in another folder", row_title_.get(), pal::Ink, RectF(132, y - 2, 362, 20));
+      PaintText(g, custom ? want_saves_.wstring() : std::wstring(L"Off: they stay in this folder (resources\\userdata)."),
+                row_detail_.get(), custom ? pal::Soft : pal::Muted, RectF(132, y + 17, 362, 18), StringAlignmentNear,
+                false, custom);
+      PaintButton(g, kSavesBrowse, L"Choose folder", Enabled(kSavesBrowse), false, pill_.get());
+    }
     }  // extras
 
     // A cleared flower: six jewels around a silver centre, once it is ready.
@@ -735,7 +771,7 @@ void SetupWindow::Paint(HDC dc) {
 
     // Footer and the two buttons.
     PaintText(g, update_mode_ ? std::wstring(L"This copy v") + kVersion : std::wstring(L"Title ID 584107D1"), foot_.get(),
-              pal::Muted, RectF(98, 524, 220, 18));
+              pal::Muted, RectF(98, 570, 220, 18));
     const wchar_t* left = mode_ == Mode::Importing ? (cancel_.load() ? L"Cancelling" : L"Cancel") : L"Close";
     PaintButton(g, kLeft, left, Enabled(kLeft), false, button_.get());
     PaintButton(g, kPlay, L"PLAY", Enabled(kPlay), true, play_.get());
@@ -760,6 +796,8 @@ void SetupWindow::Start() {
   // switches it off.
   was_ = installed_ ? CurrentExtras(p_, options_.shortcut_folder) : Extras{};
   want_ = was_;
+  was_saves_ = p_.custom_userdata ? p_.userdata : fs::path();
+  want_saves_ = was_saves_;
   if (!options_.package.empty()) {
     SelectPath(options_.package);
     return;
@@ -770,7 +808,8 @@ void SetupWindow::Start() {
     hint_ = L"Press Play, change your extras, or import again to repair the game data.";
     path_text_ = L"resources\\assets";
     path_set_ = true;
-    status_ = L"Game data imported. Saves and high scores are in resources\\userdata.";
+    status_ = p_.custom_userdata ? L"Game data imported. Saves and high scores are in the folder shown below."
+                                 : L"Game data imported. Saves and high scores are in resources\\userdata.";
     status_color_ = pal::Ok;
     phase_.clear();
     Invalidate();
@@ -830,6 +869,37 @@ void SetupWindow::Browse() {
     }
   }
   dialog->Release();
+}
+
+// The folder for saves, high scores and settings (applied on Play).
+void SetupWindow::ChooseSavesFolder() {
+  IFileOpenDialog* dialog = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+  DWORD flags = 0;
+  dialog->GetOptions(&flags);
+  dialog->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT);
+  dialog->SetTitle(L"Choose a folder for your Hexic HD saves and settings");
+  dialog->SetOkButtonLabel(L"Use this folder");
+  IShellItem* start = nullptr;
+  const fs::path from = want_saves_.empty() ? p_.root : want_saves_;
+  if (SUCCEEDED(SHCreateItemFromParsingName(from.c_str(), nullptr, IID_PPV_ARGS(&start)))) {
+    dialog->SetFolder(start);
+    start->Release();
+  }
+  if (SUCCEEDED(dialog->Show(hwnd_))) {
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(dialog->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        // Choosing this release's own userdata folder is the default.
+        want_saves_ = SameFile(path, p_.resources / L"userdata") ? fs::path() : fs::path(path);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dialog->Release();
+  Invalidate();
 }
 
 void SetupWindow::SelectPath(const fs::path& path) {
@@ -1033,6 +1103,16 @@ void SetupWindow::OnUpdateDone(UpdateOutcome* outcome) {
 
 void SetupWindow::Play() {
   KillTimer(hwnd_, kRestartTimer);
+  // A new saves folder first, so the extras (fullscreen is a setting) go there.
+  if (_wcsicmp(want_saves_.wstring().c_str(), was_saves_.wstring().c_str()) != 0) {
+    std::wstring message;
+    if (!SetUserDataLocation(p_, want_saves_, &message)) {
+      MessageBoxW(hwnd_, message.c_str(), L"Hexic HD", MB_OK | MB_ICONWARNING);
+      return;
+    }
+    was_saves_ = want_saves_;
+    MessageBoxW(hwnd_, message.c_str(), L"Hexic HD", MB_OK | MB_ICONINFORMATION);
+  }
   const std::wstring note = ApplyExtras(p_, want_, was_, options_.shortcut_folder, [this](const fs::path& link) {
     const std::wstring text = L"There is already a Hexic HD shortcut on your desktop that opens a different copy:\n\n" +
                               link.wstring() + L"\n\nReplace it with one for this folder?";
@@ -1075,6 +1155,12 @@ void SetupWindow::Click(Control id) {
     case kPlay: Play(); break;
     case kExtra0: want_.fullscreen = !want_.fullscreen; break;
     case kExtra1: want_.shortcut = !want_.shortcut; break;
+    case kSaves:
+      // Off: choose a folder; on: back to this folder (resources\userdata).
+      if (want_saves_.empty()) ChooseSavesFolder();
+      else want_saves_.clear();
+      break;
+    case kSavesBrowse: ChooseSavesFolder(); break;
     default:
       if (id >= kRow0 && id - kRow0 < static_cast<int>(candidates_.size())) StartImport(candidates_[id - kRow0]);
       break;

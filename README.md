@@ -11,8 +11,9 @@ data from it.
 
 - **Portable, one program.** Extract the release and open `Hexic HD.exe`. The first
   time, it imports your package into `resources\assets`; saves, high scores and
-  settings stay in `resources\userdata`. Nothing is installed elsewhere, no
-  administrator rights or registry entries, and the folder can be moved or copied.
+  settings stay in `resources\userdata`, or in a folder of your choice (an
+  optional setup extra). Nothing is installed elsewhere, no administrator rights or
+  registry entries, and the folder can be moved or copied.
 - **Mouse, keyboard and controller**, switched on the fly. Point at a menu item to
   highlight it and click to choose it (right click goes back); in a game the
   highlighted pieces follow the pointer, left click rotates them clockwise and right

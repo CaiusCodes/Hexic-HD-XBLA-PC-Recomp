@@ -37,8 +37,9 @@ FIRST-TIME SETUP
    or click "Browse package". Setup checks it first and tells you if it is
    the wrong file or an unsupported version; the import starts as soon as it
    is accepted. You can cancel it at any time.
-4. Tick any extras you want (both optional, both off unless ticked):
-     Start in fullscreen, Create desktop shortcut.
+4. Tick any extras you want (all optional, all off unless ticked):
+     Start in fullscreen, Create desktop shortcut, and Keep saves and
+     settings in another folder ("Choose folder" picks it; see PORTABLE DATA).
 5. Click PLAY once it says HEXIC HD IS READY.
 
 From then on, opening "Hexic HD.exe" starts the game straight away. Setup
@@ -166,6 +167,16 @@ Everything stays inside the extracted "Hexic HD PC" folder:
 
 Paths are relative, so the folder can be moved or copied anywhere (a USB
 drive works too). To back up your progress, copy resources\userdata.
+
+Saves elsewhere (optional). In setup ("Hexic HD.exe --setup" reopens it),
+tick "Keep saves and settings in another folder" and choose a folder, for
+example in Documents or on another drive; it applies when you press Play.
+Your current saves, high scores and settings are copied there (files already
+in that folder are never overwritten, and the old copy is left as it was),
+and resources\userdata-location.txt records the folder. Untick it to go back
+to resources\userdata. Updates never change this. If the chosen folder is
+missing when you start (a drive not connected), Hexic HD says so instead of
+starting with empty saves.
 
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
