@@ -81,7 +81,7 @@ Player
                        (up to 15 characters). The game picks a fun name for
                        you the first time; leave it empty to get another
 Controls
-  Keyboard controls    Change the keys (see CONTROLS)
+  (the key list)       Change the keys (see CONTROLS)
 Updates
   Check for Updates    Shows your version. Press it to ask GitHub whether a
                        newer release of this port exists (see UPDATES)
@@ -129,14 +129,15 @@ in for a controller input. The defaults:
   Bumpers, Back button        1 / 3, Tab
   Right stick                 I J K L, stick clicks C / V
 
-To change them, open Settings > Keyboard Controls. Every controller input
-is listed with its keys:
-  Enter / A          change the key (then press the new key; Esc cancels)
-  Tab / Y            add a second key
-  Backspace / X      reset that input to its default
-Reset All to Defaults restores every key. Giving an input a key that another
-input uses swaps them, so nothing is left without a key. Mouse buttons can be
-bound too.
+To change them, open Settings > Controls. Every controller input is listed
+with its keys:
+  Click / Enter / A  change the key (then press the new key; Esc or a click
+                     cancels)
+  + Add / Tab / Y    add another key (up to three)
+  Reset / Backspace / X   reset that input to its default
+"Reset all" at the end restores every key. Giving an input a key that another
+input uses swaps them, so nothing is left without a key. Mouse buttons are not
+bound: the mouse plays the game by itself (see above).
 
 The Settings panels use the arrow keys, Enter and Esc, or the D-pad, A and
 B, or the mouse.

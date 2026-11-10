@@ -504,6 +504,49 @@ class HexicMenuInput {
   std::chrono::steady_clock::time_point repeat_at_[kCount] = {};
 };
 
+// Settings > Controls: every controller input with the keys bound to it, drawn
+// inside the Settings panel (in its style) rather than as a dialog of its own.
+// Keyboard / pad: Up / Down choose, Enter / A change the key, Tab / Y add one,
+// Backspace / X reset that input. Mouse: hover chooses, click a row to change
+// its key, Add / Reset on the chosen row, the wheel scrolls. The last row
+// resets every key. While waiting for a key, Esc, B or a click cancels.
+class HexicControlsPanel {
+ public:
+  bool Capturing() const { return capture_ != kCaptureIdle; }
+  // After input.Poll (not capturing): the list's keys. While capturing: the
+  // capture, which reads the keyboard directly (input is re-primed after).
+  void Update(bool focused, HexicMenuInput& input);
+  // The list in [lo, hi], with the mouse (click: a left click this frame).
+  void Draw(ImDrawList* dl, ImFont* font, ImVec2 lo, ImVec2 hi, ImVec2 mouse, bool mouse_moved,
+            bool click, float wheel);
+  std::string Help() const;
+
+ private:
+  enum Capture : int { kCaptureIdle, kCaptureWaitRelease, kCaptureListen, kCaptureFinish };
+
+  int RowCount() const { return int(hexic_controls::Bindings().size()) + 1; }
+  int ResetAllRow() const { return int(hexic_controls::Bindings().size()); }
+
+  void Activate(int row, bool append);
+  void ResetRow(int row);
+  void ResetAllKeys();
+  void TickCapture(bool focused, HexicMenuInput& input);
+  void FinishCapture(const std::string& notice);
+  void Notice(int row, const std::string& text, int seconds);
+
+  int selected_ = 0;
+  int scroll_top_ = 0;
+  int visible_rows_ = 8;
+
+  Capture capture_ = kCaptureIdle;
+  int capture_row_ = -1;
+  bool capture_append_ = false;
+  std::chrono::steady_clock::time_point capture_deadline_{};
+  int notice_row_ = -1;
+  std::string notice_;
+  std::chrono::steady_clock::time_point notice_until_{};
+};
+
 // The PC settings panel, shown in place of Hexic HD's own (Xbox-only)
 // Achievements viewer. Categories down the side (Display, Graphics, Player,
 // Controls); the chosen category's settings on the right, every choice shown
@@ -561,6 +604,7 @@ class HexicSettingsDialog : public rex::ui::ImGuiDialog {
 
   HexicHdApp* app_;
   HexicMenuInput input_;
+  HexicControlsPanel controls_;
   bool has_opened_shown_ = false;
   Category category_ = kDisplay;
   int item_ = kItemDisplayMode;
@@ -626,44 +670,6 @@ class HexicUpdateDialog : public rex::ui::ImGuiDialog {
   std::chrono::steady_clock::time_point opened_at_{};
 };
 
-// Settings > Keyboard Controls: every controller input with the keys bound
-// to it. Enter changes a key, Tab adds a second one, Backspace resets that
-// input, plus Reset All and Done rows at the end.
-class HexicControlsDialog : public rex::ui::ImGuiDialog {
- public:
-  HexicControlsDialog(rex::ui::ImGuiDrawer* imgui_drawer, HexicHdApp* app);
-
-  void OnDraw(ImGuiIO& io) override;
-
- protected:
-  void OnClose() override;
-
- private:
-  enum Capture : int { kCaptureIdle, kCaptureWaitRelease, kCaptureListen, kCaptureFinish };
-
-  int RowCount() const { return int(hexic_controls::Bindings().size()) + 2; }
-  int ResetAllRow() const { return int(hexic_controls::Bindings().size()); }
-  int DoneRow() const { return ResetAllRow() + 1; }
-
-  void Activate(int row, bool append);
-  void ResetRow(int row);
-  void TickCapture();
-  void FinishCapture(const std::string& notice);
-
-  HexicHdApp* app_;
-  HexicMenuInput input_;
-  bool has_opened_shown_ = false;
-  int selected_ = 0;
-  int scroll_top_ = 0;
-
-  Capture capture_ = kCaptureIdle;
-  int capture_row_ = -1;
-  bool capture_append_ = false;
-  std::chrono::steady_clock::time_point capture_deadline_{};
-  int notice_row_ = -1;
-  std::string notice_;
-  std::chrono::steady_clock::time_point notice_until_{};
-};
 
 // Invisible dialog that exists only for its per-frame OnDraw() hook
 // (ImGuiDrawer only calls OnDraw() for dialogs in its list): it retries
@@ -1101,9 +1107,6 @@ class HexicHdApp : public rex::ReXApp {
     if (imgui_drawer_) imgui_drawer_->AddDialog(new HexicNameEntryDialog(imgui_drawer_, this));
   }
 
-  void OpenControls() {
-    if (imgui_drawer_) imgui_drawer_->AddDialog(new HexicControlsDialog(imgui_drawer_, this));
-  }
 
   // ---- Settings > Updates > Check for Updates ------------------------------
   // Only when the player asks (ported from Perfect Dark's): the box asks
@@ -1711,8 +1714,6 @@ inline void HexicSettingsDialog::SelectCategory(Category category) {
 inline void HexicSettingsDialog::Activate(int item) {
   if (item == kRowPlayerName) {
     app_->OpenNameEntry();
-  } else if (item == kRowControls) {
-    app_->OpenControls();
   } else if (item == kRowUpdates) {
     app_->OpenUpdateDialog();
   } else {
@@ -1729,24 +1730,37 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
     has_opened_shown_ = true;
   }
 
-  // Keyboard and controller.
-  input_.Poll(app_ && app_->HasWindowFocus());
-  const int first = FirstItem(category_);
-  const int count = ItemCount(category_);
+  // Keyboard and controller. While the Controls list waits for a key, that
+  // key is all that is read (Esc / B cancel it rather than closing Settings).
+  const bool window_focused = app_ && app_->HasWindowFocus();
+  const bool capturing = controls_.Capturing();
   bool close = false;
-  if (input_.Pressed(HexicMenuInput::kPrevPage))
-    SelectCategory(Category((category_ + kCategoryCount - 1) % kCategoryCount));
-  if (input_.Pressed(HexicMenuInput::kNextPage))
-    SelectCategory(Category((category_ + 1) % kCategoryCount));
-  if (input_.Pressed(HexicMenuInput::kUp)) item_ = first + (item_ - first + count - 1) % count;
-  if (input_.Pressed(HexicMenuInput::kDown)) item_ = first + (item_ - first + 1) % count;
-  const auto options = Options(item_);
-  if (!options.empty()) {
-    const int n = int(options.size());
-    if (input_.Pressed(HexicMenuInput::kLeft)) Choose(item_, (Current(item_) + n - 1) % n);
-    if (input_.Pressed(HexicMenuInput::kRight)) Choose(item_, (Current(item_) + 1) % n);
+  bool confirm = false;
+  if (capturing) {
+    controls_.Update(window_focused, input_);
+  } else {
+    input_.Poll(window_focused);
+    const int first = FirstItem(category_);
+    const int count = ItemCount(category_);
+    if (input_.Pressed(HexicMenuInput::kPrevPage))
+      SelectCategory(Category((category_ + kCategoryCount - 1) % kCategoryCount));
+    if (input_.Pressed(HexicMenuInput::kNextPage))
+      SelectCategory(Category((category_ + 1) % kCategoryCount));
+    if (category_ == kControls) {
+      controls_.Update(window_focused, input_);
+    } else {
+      if (input_.Pressed(HexicMenuInput::kUp)) item_ = first + (item_ - first + count - 1) % count;
+      if (input_.Pressed(HexicMenuInput::kDown)) item_ = first + (item_ - first + 1) % count;
+      const auto options = Options(item_);
+      if (!options.empty()) {
+        const int n = int(options.size());
+        if (input_.Pressed(HexicMenuInput::kLeft)) Choose(item_, (Current(item_) + n - 1) % n);
+        if (input_.Pressed(HexicMenuInput::kRight)) Choose(item_, (Current(item_) + 1) % n);
+      }
+      confirm = input_.Pressed(HexicMenuInput::kConfirm);
+    }
+    if (input_.Pressed(HexicMenuInput::kBack)) close = true;
   }
-  if (input_.Pressed(HexicMenuInput::kBack)) close = true;
 
   ImGuiViewport* viewport = ImGui::GetMainViewport();
   const ImVec2 view_pos = viewport ? viewport->Pos : ImVec2(0, 0);
@@ -1778,8 +1792,9 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
     const ImVec2 mouse = io.MousePos;
     const bool mouse_moved = mouse.x != last_mouse_.x || mouse.y != last_mouse_.y;
     last_mouse_ = mouse;
-    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) close = true;
+    // (A click while the Controls list waits for a key only cancels that.)
+    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !capturing;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !capturing) close = true;
 
     // Panel and sidebar.
     dl->AddRectFilled(o, end, kPanel, 14.0f);
@@ -1802,10 +1817,14 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
            kCategoryNames[c]);
     }
 
-    // The chosen category's settings.
+    // The chosen category's settings (Controls: the key list).
     const float content_x = o.x + kSidebarWidth + 24.0f;
     const float right_x = end.x - 28.0f;
-    for (int i = 0; i < ItemCount(category_); ++i) {
+    if (category_ == kControls) {
+      controls_.Draw(dl, font, ImVec2(content_x - 12.0f, o.y + 30.0f), ImVec2(right_x + 12.0f, end.y - 96.0f),
+                     mouse, mouse_moved, click, io.MouseWheel);
+    }
+    for (int i = 0; category_ != kControls && i < ItemCount(category_); ++i) {
       const int item = FirstItem(category_) + i;
       const ImVec2 lo(content_x - 12.0f, o.y + 40.0f + i * kRowPitch);
       const ImVec2 hi(right_x + 12.0f, lo.y + kRowHeight);
@@ -1861,15 +1880,19 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
     }
 
     // What the selected setting does, and the controls.
-    const std::string help = Help(item_);
+    const std::string help = category_ == kControls ? controls_.Help() : Help(item_);
     Text(dl, font, 16.0f, ImVec2(content_x + 8.0f, end.y - 82.0f), kMuted, help.c_str());
     // Hints for the device in use (hexic_input_mode.h).
-    const char* hints = hexic_input_mode::UsingController()
-                            ? "LB / RB  Category      D-pad  Change      A  Open      B  Back"
-                            : "Q / E  Category      Arrows  Change      Enter  Open      Esc  Back";
+    const bool pad = hexic_input_mode::UsingController();
+    const char* hints =
+        category_ == kControls
+            ? (pad ? "LB / RB  Category    A  Change    Y  Add    X  Reset    B  Back"
+                   : "Q / E  Category    Enter  Change    Tab  Add    Backspace  Reset    Esc  Back")
+            : (pad ? "LB / RB  Category      D-pad  Change      A  Open      B  Back"
+                   : "Q / E  Category      Arrows  Change      Enter  Open      Esc  Back");
     Text(dl, font, 15.0f, ImVec2(content_x + 8.0f, end.y - 46.0f), kFaint, hints);
 
-    if (input_.Pressed(HexicMenuInput::kConfirm)) Activate(item_);
+    if (confirm) Activate(item_);
     if (close) {
       ImGui::CloseCurrentPopup();
       Close();
@@ -2126,52 +2149,50 @@ inline void HexicUpdateDialog::OnDraw(ImGuiIO& io) {
   if (!still_open) Close();
 }
 
-// --- Keyboard Controls ---------------------------------------------------
+// --- Settings > Controls --------------------------------------------------
 
-inline HexicControlsDialog::HexicControlsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
-                                                HexicHdApp* app)
-    : rex::ui::ImGuiDialog(imgui_drawer), app_(app) {
-  app_->BeginModal();
+inline void HexicControlsPanel::Notice(int row, const std::string& text, int seconds) {
+  notice_row_ = row;
+  notice_ = text;
+  notice_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
 }
 
-inline void HexicControlsDialog::OnClose() { app_->EndModal(); }
-
-inline void HexicControlsDialog::Activate(int row, bool append) {
+inline void HexicControlsPanel::Activate(int row, bool append) {
   capture_row_ = row;
   capture_append_ = append;
   capture_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   notice_row_ = -1;
   capture_ = kCaptureWaitRelease;
-  REXLOG_INFO("[controls] {}: waiting for a key ({})",
-              hexic_controls::Bindings()[row].button, append ? "add" : "change");
+  REXLOG_INFO("[controls] {}: waiting for a key ({})", hexic_controls::Bindings()[row].button,
+              append ? "add" : "change");
 }
 
-inline void HexicControlsDialog::ResetRow(int row) {
+inline void HexicControlsPanel::ResetRow(int row) {
   const auto& binding = hexic_controls::Bindings()[row];
   hexic_controls::SetKeys(row, hexic_controls::SplitKeys(binding.defaults));
   HexicHdApp::SavePcSettings();
-  notice_row_ = row;
-  notice_ = "Reset to default";
-  notice_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  Notice(row, "Reset to default", 2);
 }
 
-inline void HexicControlsDialog::FinishCapture(const std::string& notice) {
-  if (!notice.empty()) {
-    notice_row_ = capture_row_;
-    notice_ = notice;
-    notice_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  }
+inline void HexicControlsPanel::ResetAllKeys() {
+  hexic_controls::ResetAll();
+  HexicHdApp::SavePcSettings();
+  Notice(ResetAllRow(), "All keys reset to defaults", 2);
+}
+
+inline void HexicControlsPanel::FinishCapture(const std::string& notice) {
+  if (!notice.empty()) Notice(capture_row_, notice, 3);
   capture_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   capture_ = kCaptureFinish;
 }
 
-// Waits for everything to be released (the key that started the capture is
-// still down), takes the next key or mouse button, then waits for that to be
-// released too before handing input back to the menu.
-inline void HexicControlsDialog::TickCapture() {
+// Waits for everything to be released (the key or click that started the
+// capture is still down), takes the next key, then waits for that to be
+// released too before handing input back to the menu. Mouse buttons are not
+// bound (the mouse plays the game itself); a click cancels, as Esc and B do.
+inline void HexicControlsPanel::TickCapture(bool focused, HexicMenuInput& input) {
   const auto now = std::chrono::steady_clock::now();
   const bool expired = now > capture_deadline_;
-  const bool focused = app_->HasWindowFocus();
   XINPUT_STATE pad{};
   const bool pad_connected = XInputGetState(0, &pad) == ERROR_SUCCESS;
   auto any_input_down = [&]() {
@@ -2197,7 +2218,9 @@ inline void HexicControlsDialog::TickCapture() {
       return;
     }
     if (!focused) return;
-    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) ||
+    const bool click = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
+                       (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
+    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || click ||
         (pad_connected && (pad.Gamepad.wButtons & XINPUT_GAMEPAD_B))) {
       FinishCapture("");
       return;
@@ -2205,12 +2228,13 @@ inline void HexicControlsDialog::TickCapture() {
     std::string key;
     for (int vk = 1; key.empty() && vk < 255; ++vk) {
       // Esc cancels and F4 opens the runtime overlay, so neither can be
-      // bound; the generic Shift/Ctrl/Alt codes are used, not left/right.
-      const bool excluded = vk == VK_ESCAPE || vk == VK_F4 || vk == VK_LWIN || vk == VK_RWIN ||
-                            vk == VK_APPS || (vk >= VK_LSHIFT && vk <= VK_RMENU);
+      // bound; the generic Shift/Ctrl/Alt codes are used, not left/right;
+      // mouse buttons are the pointer's.
+      const bool excluded = vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_ESCAPE ||
+                            vk == VK_F4 || vk == VK_LWIN || vk == VK_RWIN || vk == VK_APPS ||
+                            (vk >= VK_LSHIFT && vk <= VK_RMENU);
       if (excluded || !(GetAsyncKeyState(vk) & 0x8000)) continue;
-      key = vk == VK_RETURN ? "Return"
-                            : rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(vk));
+      key = vk == VK_RETURN ? "Return" : rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(vk));
     }
     if (key.empty()) return;
 
@@ -2245,166 +2269,148 @@ inline void HexicControlsDialog::TickCapture() {
   if (!any_input_down() || expired) {
     capture_ = kCaptureIdle;
     capture_row_ = -1;
-    input_.Reprime();
+    input.Reprime();
   }
 }
 
-inline void HexicControlsDialog::OnDraw(ImGuiIO& io) {
-  using namespace hexic_ui;
-  using hexic_controls::Bindings;
+inline void HexicControlsPanel::Update(bool focused, HexicMenuInput& input) {
+  if (Capturing()) {
+    TickCapture(focused, input);
+    return;
+  }
+  const int rows = RowCount();
+  if (input.Pressed(HexicMenuInput::kUp)) selected_ = (selected_ + rows - 1) % rows;
+  if (input.Pressed(HexicMenuInput::kDown)) selected_ = (selected_ + 1) % rows;
+  if (input.Pressed(HexicMenuInput::kConfirm)) {
+    if (selected_ == ResetAllRow()) ResetAllKeys();
+    else Activate(selected_, false);
+  }
+  if (selected_ < ResetAllRow()) {
+    if (input.Pressed(HexicMenuInput::kAlt)) Activate(selected_, true);
+    if (input.Pressed(HexicMenuInput::kReset)) ResetRow(selected_);
+  }
+}
+
+inline std::string HexicControlsPanel::Help() const {
+  if (selected_ >= ResetAllRow()) return "Every input back to Hexic's own keys";
+  const auto& binding = hexic_controls::Bindings()[selected_];
+  return std::string(binding.button) + ": " + (binding.action[0] ? binding.action : "not used by Hexic") +
+         ". Click a row to change its key";
+}
+
+inline void HexicControlsPanel::Draw(ImDrawList* dl, ImFont* font, ImVec2 lo, ImVec2 hi, ImVec2 mouse,
+                                     bool mouse_moved, bool click, float wheel) {
+  using namespace hexic_settings_ui;
   const auto now = std::chrono::steady_clock::now();
-  if (!has_opened_shown_) {
-    ImGui::OpenPopup("##HexicControls");
-    has_opened_shown_ = true;
-  }
+  constexpr float kListRowHeight = 34.0f, kListRowPitch = 38.0f, kTextSize = 17.0f;
+  const int rows = RowCount();
+  visible_rows_ = std::max(1, int((hi.y - lo.y + (kListRowPitch - kListRowHeight)) / kListRowPitch));
+  const bool capturing = Capturing();
 
-  const bool capturing = capture_ != kCaptureIdle;
-  if (capturing) {
-    TickCapture();
+  // The wheel scrolls; otherwise the chosen row is kept in view.
+  if (!capturing && wheel != 0.0f && Inside(mouse, lo, hi)) {
+    scroll_top_ -= wheel > 0 ? 1 : -1;
   } else {
-    input_.Poll(app_->HasWindowFocus());
+    if (selected_ < scroll_top_) scroll_top_ = selected_;
+    if (selected_ >= scroll_top_ + visible_rows_) scroll_top_ = selected_ - visible_rows_ + 1;
   }
+  scroll_top_ = std::clamp(scroll_top_, 0, std::max(0, rows - visible_rows_));
 
-  constexpr float kWindowWidth = 660.0f;
-  constexpr int kVisibleRows = 9;
-  constexpr float kRowHeight = 38.0f;
-  constexpr float kRowSpacing = 7.0f;
-  constexpr float kSideMargin = 26.0f;
-  const int row_count = RowCount();
-
-  PushDialogStyle(io, kWindowWidth);
-  const bool still_open =
-      ImGui::BeginPopupModal("##HexicControls", nullptr,
-                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-  if (still_open) {
-    bool close = false;
-    int activate = -1;  // a row to act on as if confirmed
-    if (!capturing) {
-      if (input_.Pressed(HexicMenuInput::kUp)) selected_ = (selected_ + row_count - 1) % row_count;
-      if (input_.Pressed(HexicMenuInput::kDown)) selected_ = (selected_ + 1) % row_count;
-      if (input_.Pressed(HexicMenuInput::kConfirm)) activate = selected_;
-      if (input_.Pressed(HexicMenuInput::kAlt) && selected_ < ResetAllRow()) {
-        Activate(selected_, true);
-      }
-      if (input_.Pressed(HexicMenuInput::kReset) && selected_ < ResetAllRow()) ResetRow(selected_);
-      if (input_.Pressed(HexicMenuInput::kBack)) close = true;
+  const float right = hi.x - 14.0f;  // room for the scroll bar
+  for (int i = 0; i < visible_rows_ && scroll_top_ + i < rows; ++i) {
+    const int row = scroll_top_ + i;
+    const ImVec2 rlo(lo.x, lo.y + i * kListRowPitch);
+    const ImVec2 rhi(right, rlo.y + kListRowHeight);
+    const bool hovered = Inside(mouse, rlo, rhi);
+    if (hovered && mouse_moved && !capturing) selected_ = row;
+    const bool focused = row == selected_;
+    if (focused) {
+      dl->AddRectFilled(rlo, rhi, IM_COL32(0xFF, 0xFF, 0xFF, 10), 7.0f);
+      dl->AddRectFilled(ImVec2(rlo.x, rlo.y + 9.0f), ImVec2(rlo.x + 3.0f, rhi.y - 9.0f), kGreen);
     }
+    const float text_y = rlo.y + (kListRowHeight - kTextSize) * 0.5f;
+    const bool noticed = row == notice_row_ && now < notice_until_;
+    const ImU32 yellow = IM_COL32(0xFF, 0xE8, 0x7A, 255);
 
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImVec2 window_pos = ImGui::GetWindowPos();
-    const float list_height = kVisibleRows * kRowHeight + (kVisibleRows - 1) * kRowSpacing;
-    const ImVec2 window_size(kWindowWidth, 55.0f + 44.0f + list_height + 64.0f);
-    const ImVec2 window_end(window_pos.x + window_size.x, window_pos.y + window_size.y);
-    ImGui::Dummy(window_size);
+    // Small outlined buttons, right to left, for the chosen row (and the
+    // reset-all row): click them; they also say which key does the same.
+    float x = rhi.x - 8.0f;
+    auto small_button = [&](const char* label) {
+      const float w = Width(font, 15.0f, label) + 20.0f;
+      const ImVec2 blo(x - w, rlo.y + 5.0f), bhi(x, rhi.y - 5.0f);
+      const bool over = Inside(mouse, blo, bhi);
+      if (over) dl->AddRectFilled(blo, bhi, kHover, 5.0f);
+      dl->AddRect(blo, bhi, over ? kOutlineFocus : kOutline, 5.0f, 0, 1.0f);
+      Text(dl, font, 15.0f, ImVec2(blo.x + 10.0f, blo.y + (bhi.y - blo.y - 15.0f) * 0.5f), over ? kInk : kSoft,
+           label);
+      x -= w + 6.0f;
+      return over && click && !capturing;
+    };
 
-    const float accent_y =
-        DrawHexicCard(draw_list, window_pos, window_end, kSideMargin, "KEYBOARD CONTROLS");
-    DrawHint(draw_list, window_pos.x, window_end.x, accent_y + 10.0f,
-             "Keys for each controller input. A controller works alongside them.");
-
-    // Mouse wheel scrolls; the selection is otherwise kept in view.
-    if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f && !capturing) {
-      scroll_top_ -= io.MouseWheel > 0 ? 1 : -1;
-    } else {
-      if (selected_ < scroll_top_) scroll_top_ = selected_;
-      if (selected_ >= scroll_top_ + kVisibleRows) scroll_top_ = selected_ - kVisibleRows + 1;
-    }
-    scroll_top_ = std::clamp(scroll_top_, 0, row_count - kVisibleRows);
-
-    const float list_top = accent_y + 44.0f;
-    const float row_left = window_pos.x + kSideMargin;
-    const float row_right = window_end.x - kSideMargin;
-    for (int i = 0; i < kVisibleRows; ++i) {
-      const int row = scroll_top_ + i;
-      const ImVec2 pos(row_left, list_top + i * (kRowHeight + kRowSpacing));
-      const ImVec2 max(row_right, pos.y + kRowHeight);
-      const bool selected = row == selected_;
-      DrawGamePill(draw_list, pos, max, selected);
-      const float text_y = pos.y + (kRowHeight - BodySize()) * 0.5f;
-      const bool noticed = row == notice_row_ && now < notice_until_;
-
-      if (row >= ResetAllRow()) {
-        const char* label = row == DoneRow() ? "Done" : "Reset All to Defaults";
-        if (noticed) label = notice_.c_str();
-        ImVec2 size = BodyFont()->CalcTextSizeA(BodySize(), FLT_MAX, 0, label);
-        DrawPillText(draw_list, BodyFont(), BodySize(),
-                     ImVec2(pos.x + (max.x - pos.x - size.x) * 0.5f, text_y),
-                     kTextSelected, label);
-      } else {
-        const auto& binding = Bindings()[row];
-        std::string value;
-        if (capture_row_ == row && (capture_ == kCaptureWaitRelease || capture_ == kCaptureListen)) {
-          value = "Press a key...  (Esc cancels)";
-        } else if (noticed) {
-          value = notice_;
-        } else {
-          value = hexic_controls::FormatKeys(hexic_controls::KeysOf(row));
-        }
-        const float value_width =
-            BodyFont()->CalcTextSizeA(BodySize(), FLT_MAX, 0, value.c_str()).x;
-        const float value_x = max.x - 20.0f - value_width;
-        DrawPillText(draw_list, BodyFont(), BodySize(), ImVec2(pos.x + 20.0f, text_y),
-                     kTextSelected, binding.button);
-        if (binding.action[0]) {
-          draw_list->PushClipRect(ImVec2(pos.x + 178.0f, pos.y), ImVec2(value_x - 12.0f, max.y),
-                                  true);
-          draw_list->AddText(BodyFont(), BodySize(), ImVec2(pos.x + 178.0f, text_y),
-                             IM_COL32(0xE4, 0xDC, 0xF8, 170), binding.action);
-          draw_list->PopClipRect();
-        }
-        const ImU32 value_color = (capture_row_ == row || noticed)
-                                      ? IM_COL32(0xFF, 0xE8, 0x7A, 255)
-                                      : IM_COL32(0xF0, 0xF0, 0xFA, 255);
-        DrawPillText(draw_list, BodyFont(), BodySize(), ImVec2(value_x, text_y), value_color,
-                     value.c_str());
-      }
-
-      // Mouse: clicking a row selects it and acts on it.
-      ImGui::PushID(row);
-      ImGui::SetCursorScreenPos(pos);
-      if (ImGui::InvisibleButton("row", ImVec2(max.x - pos.x, kRowHeight)) && !capturing) {
+    if (row == ResetAllRow()) {
+      Text(dl, font, kTextSize, ImVec2(rlo.x + 12.0f, text_y), focused ? kInk : kSoft,
+           noticed ? notice_.c_str() : "Reset all keys to defaults");
+      // Only its button resets (a stray click on the row should not).
+      if (small_button("Reset all")) {
         selected_ = row;
-        activate = row;
+        ResetAllKeys();
       }
-      ImGui::PopID();
+      continue;
     }
 
-    // Scroll position, as a thin bar beside the list.
-    const float track_x = window_end.x - 16.0f;
-    const float thumb_h = list_height * float(kVisibleRows) / float(row_count);
-    const float thumb_y =
-        list_top + (list_height - thumb_h) * float(scroll_top_) / float(row_count - kVisibleRows);
-    draw_list->AddRectFilled(ImVec2(track_x, list_top), ImVec2(track_x + 4.0f, list_top + list_height),
-                             IM_COL32(0x5A, 0x50, 0x92, 90), 2.0f);
-    draw_list->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + 4.0f, thumb_y + thumb_h),
-                             kAccentCyan, 2.0f);
-
-    const float footer_y = list_top + list_height + 16.0f;
-    DrawHint(draw_list, window_pos.x, window_end.x, footer_y,
-             "Enter/A  Change     Tab/Y  Add a key     Backspace/X  Reset     Esc/B  Back");
-
-    if (activate >= 0) {
-      if (activate < ResetAllRow()) {
-        Activate(activate, false);
-      } else if (activate == ResetAllRow()) {
-        hexic_controls::ResetAll();
-        HexicHdApp::SavePcSettings();
-        notice_row_ = activate;
-        notice_ = "All keys reset to defaults";
-        notice_until_ = now + std::chrono::seconds(2);
-      } else {
-        close = true;
+    const auto& binding = hexic_controls::Bindings()[row];
+    Text(dl, font, kTextSize, ImVec2(rlo.x + 12.0f, text_y), focused ? kInk : kSoft, binding.button);
+    bool handled = false;
+    if (focused && !capturing) {
+      if (small_button("Reset")) {
+        ResetRow(row);
+        handled = true;
+      }
+      if (small_button("+ Add")) {
+        Activate(row, true);
+        handled = true;
       }
     }
-    if (close) {
-      app_->OpenSettings(HexicSettingsDialog::kRowControls);
-      ImGui::CloseCurrentPopup();
-      Close();
+    // The keys, as chips (or the capture prompt / a notice).
+    if (capture_row_ == row && (capture_ == kCaptureWaitRelease || capture_ == kCaptureListen)) {
+      const char* prompt = capture_append_ ? "Press a key to add  (Esc cancels)" : "Press a key  (Esc cancels)";
+      Text(dl, font, 15.0f, ImVec2(x - Width(font, 15.0f, prompt), rlo.y + (kListRowHeight - 15.0f) * 0.5f), yellow,
+           prompt);
+    } else if (noticed) {
+      Text(dl, font, 15.0f, ImVec2(x - Width(font, 15.0f, notice_.c_str()), rlo.y + (kListRowHeight - 15.0f) * 0.5f),
+           yellow, notice_.c_str());
+    } else {
+      const auto keys = hexic_controls::KeysOf(row);
+      if (keys.empty()) {
+        Text(dl, font, 15.0f, ImVec2(x - Width(font, 15.0f, "Not bound"), rlo.y + (kListRowHeight - 15.0f) * 0.5f),
+             kFaint, "Not bound");
+      }
+      for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        const std::string name = hexic_controls::KeyDisplayName(*it);
+        const float w = std::max(30.0f, Width(font, 15.0f, name.c_str()) + 16.0f);
+        const ImVec2 clo(x - w, rlo.y + 5.0f), chi(x, rhi.y - 5.0f);
+        dl->AddRectFilled(clo, chi, IM_COL32(0xFF, 0xFF, 0xFF, focused ? 30 : 18), 5.0f);  // a keycap
+        dl->AddRect(clo, chi, focused ? kOutlineFocus : kOutline, 5.0f, 0, 1.0f);
+        Text(dl, font, 15.0f, ImVec2(clo.x + (w - Width(font, 15.0f, name.c_str())) * 0.5f, clo.y + (chi.y - clo.y - 15.0f) * 0.5f),
+             focused ? kInk : kSoft, name.c_str());
+        x -= w + 6.0f;
+      }
     }
-    ImGui::EndPopup();
+    // A click anywhere else on the row changes its key.
+    if (hovered && click && !capturing && !handled) {
+      selected_ = row;
+      Activate(row, false);
+    }
   }
-  PopDialogStyle();
-  if (!still_open) Close();
+
+  // Scroll position, as a thin bar beside the list.
+  if (rows > visible_rows_) {
+    const float list_h = visible_rows_ * kListRowPitch - (kListRowPitch - kListRowHeight);
+    const float thumb_h = list_h * float(visible_rows_) / float(rows);
+    const float thumb_y = lo.y + (list_h - thumb_h) * float(scroll_top_) / float(rows - visible_rows_);
+    dl->AddRectFilled(ImVec2(hi.x - 4.0f, lo.y), ImVec2(hi.x, lo.y + list_h), IM_COL32(0xFF, 0xFF, 0xFF, 18), 2.0f);
+    dl->AddRectFilled(ImVec2(hi.x - 4.0f, thumb_y), ImVec2(hi.x, thumb_y + thumb_h), kGreen, 2.0f);
+  }
 }
 
 inline void HexicSignInHook::OnDraw(ImGuiIO& /*io*/) {
