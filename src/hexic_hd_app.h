@@ -48,6 +48,7 @@
 
 #include "hexic_input.h"
 #include "hexic_input_mode.h"
+#include "hexic_language.h"
 #include "hexic_mouse.h"
 #include "hexic_player_names.h"
 #include "hexic_system_info.h"
@@ -570,6 +571,7 @@ class HexicSettingsDialog : public rex::ui::ImGuiDialog {
     kItemUpscaling,
     kItemRenderer,
     kRowPlayerName,
+    kItemLanguage,
     kRowControls,
     kRowUpdates,
     kItemCount,
@@ -979,6 +981,15 @@ class HexicHdApp : public rex::ReXApp {
     const bool controller_at_start = hexic_title::ControllerConnected() ||
                                      (input_system && input_system->AnyControllerConnected());
     hexic_title::ApplyMenuText(hexic_paths::DataRoot() / "assets", controller_at_start);
+    // The language the game loads its text in (it asks XGetLanguage once, as
+    // it starts; the SDK answers from user_language), and the PC wording in
+    // every translation (hexic_language.h).
+    startup_language_ = GetPcLanguage();
+    const auto& language = hexic_language::Effective();
+    rex::cvar::SetFlagByName("user_language", std::to_string(language.xlanguage));
+    hexic_language::ApplyTranslations(hexic_paths::DataRoot() / "assets", controller_at_start);
+    REXLOG_INFO("[language] {} (setting: {})", language.name,
+                hexic_language::kLanguages[startup_language_].code);
     // Button prompts follow the device in use (hexic_input_mode.h).
     hexic_input_mode::g_mode.store(controller_at_start ? hexic_input_mode::kController
                                                        : hexic_input_mode::kKeyboardMouse);
@@ -1416,6 +1427,19 @@ class HexicHdApp : public rex::ReXApp {
 
   static bool PcRendererPendingRestart() { return GetPcRenderer() != startup_renderer_; }
 
+  // Language: an index into hexic_language::kLanguages (0 Auto). The game reads
+  // its text once, as it starts, so a change applies on the next restart.
+  static int GetPcLanguage() { return hexic_language::IndexOf(rex::cvar::GetFlagByName("hexic_language")); }
+
+  static void SetPcLanguage(int index) {
+    if (index >= 0 && index < hexic_language::kLanguageCount &&
+        rex::cvar::SetFlagByName("hexic_language", hexic_language::kLanguages[index].code)) {
+      SavePcSettings();
+    }
+  }
+
+  static bool PcLanguagePendingRestart() { return GetPcLanguage() != startup_language_; }
+
   // Anti-Aliasing: 0 Off, 1 FXAA, 2 FXAA Extreme (swap_post_effect, a filter on
   // the finished picture). The SDK re-reads it every vblank, so it applies live.
   static int GetPcAntiAliasing() {
@@ -1507,6 +1531,7 @@ class HexicHdApp : public rex::ReXApp {
  private:
   inline static HexicHdApp* current_instance_ = nullptr;
   inline static int startup_renderer_ = 0;  // GetPcRenderer() when the game started
+  inline static int startup_language_ = 0;  // GetPcLanguage() when the game started
   hexic_input::TestPresses test_presses_;
   hexic_title::AnyKeyStarts any_key_starts_;
   TitleInputListener title_input_{&any_key_starts_};
@@ -1609,7 +1634,7 @@ inline HexicSettingsDialog::Category HexicSettingsDialog::CategoryOf(int item) {
   if (item <= kItemShowFps) return kDisplay;
   if (item <= kItemRenderer) return kGraphics;
   if (item == kRowUpdates) return kUpdates;
-  return item == kRowPlayerName ? kPlayer : kControls;
+  return (item == kRowPlayerName || item == kItemLanguage) ? kPlayer : kControls;
 }
 
 inline int HexicSettingsDialog::FirstItem(Category category) {
@@ -1619,7 +1644,7 @@ inline int HexicSettingsDialog::FirstItem(Category category) {
 }
 
 inline int HexicSettingsDialog::ItemCount(Category category) {
-  static const int kCount[kCategoryCount] = {4, 4, 1, 1, 1};
+  static const int kCount[kCategoryCount] = {4, 4, 2, 1, 1};
   return kCount[category];
 }
 
@@ -1633,6 +1658,11 @@ inline std::vector<const char*> HexicSettingsDialog::Options(int item) {
     case kItemAntiAliasing: return {"Off", "FXAA", "Extreme"};
     case kItemUpscaling: return {"Off", "FSR"};
     case kItemRenderer: return {"Auto", "D3D12", "Vulkan"};
+    case kItemLanguage: {
+      std::vector<const char*> names;
+      for (const auto& language : hexic_language::kLanguages) names.push_back(language.name);
+      return names;
+    }
     default: return {};
   }
 }
@@ -1647,6 +1677,7 @@ inline int HexicSettingsDialog::Current(int item) {
     case kItemAntiAliasing: return HexicHdApp::GetPcAntiAliasing();
     case kItemUpscaling: return HexicHdApp::GetPcFsr() ? 1 : 0;
     case kItemRenderer: return HexicHdApp::GetPcRenderer();
+    case kItemLanguage: return HexicHdApp::GetPcLanguage();
     default: return 0;
   }
 }
@@ -1667,6 +1698,7 @@ inline void HexicSettingsDialog::Choose(int item, int option) {
     case kItemAntiAliasing: HexicHdApp::SetPcAntiAliasing(option); break;
     case kItemUpscaling: HexicHdApp::SetPcFsr(option == 1); break;
     case kItemRenderer: HexicHdApp::SetPcRenderer(option); break;
+    case kItemLanguage: HexicHdApp::SetPcLanguage(option); break;
     default: break;
   }
 }
@@ -1674,7 +1706,7 @@ inline void HexicSettingsDialog::Choose(int item, int option) {
 inline const char* HexicSettingsDialog::Label(int item) {
   static const char* kLabels[kItemCount] = {
       "Display mode",  "Window size", "VSync",    "Show FPS",    "Render scale",
-      "Anti-aliasing", "Upscaling",  "Renderer", "Player name", "Keyboard controls",
+      "Anti-aliasing", "Upscaling",  "Renderer", "Player name", "Language", "Keyboard controls",
       "Check for Updates",
   };
   return kLabels[item];
@@ -1698,6 +1730,11 @@ inline std::string HexicSettingsDialog::Help(int item) {
                  ? "Applies the next time you start the game"
                  : "Auto: Direct3D 12 on NVIDIA, Vulkan on AMD and Intel";
     case kRowPlayerName: return "Shown on High Scores";
+    case kItemLanguage:
+      if (HexicHdApp::PcLanguagePendingRestart()) return "Applies the next time you start the game";
+      return HexicHdApp::GetPcLanguage() == 0
+                 ? std::string("The game's text. Auto: ") + hexic_language::Effective().name + " (your Windows language)"
+                 : "The game's text. These Settings stay in English";
     case kRowControls: return "Change the key for every controller button";
     case kRowUpdates: return "Asks GitHub for a newer version. Nothing is checked unless you ask";
     default: return "";
@@ -1850,8 +1887,35 @@ inline void HexicSettingsDialog::OnDraw(ImGuiIO& io) {
         if (row_hovered && click) Activate(item);
         continue;
       }
-      // Every choice as a segment, right-aligned; the current one filled.
       const int n = int(choices.size());
+      if (n > 4) {
+        // Too many to show side by side (Language): "<  current  >", where a
+        // click on either half steps that way (as Left / Right do).
+        const int current = Current(item);
+        std::string value = choices[current];
+        if (item == kItemLanguage && HexicHdApp::PcLanguagePendingRestart()) value += "  (restart)";
+        const float box_w = 300.0f, box_h = 32.0f;
+        const ImVec2 blo(right_x - box_w, lo.y + (kRowHeight - box_h) * 0.5f);
+        const ImVec2 bhi(right_x, blo.y + box_h);
+        const ImVec2 mid((blo.x + bhi.x) * 0.5f, bhi.y);
+        const bool left_hovered = Inside(mouse, blo, ImVec2(mid.x, bhi.y));
+        const bool right_hovered = Inside(mouse, ImVec2(mid.x, blo.y), bhi);
+        if ((left_hovered || right_hovered) && click) {
+          item_ = item;
+          Choose(item, (current + (left_hovered ? n - 1 : 1)) % n);
+        }
+        if (left_hovered || right_hovered) dl->AddRectFilled(blo, bhi, kHover, 6.0f);
+        dl->AddRect(blo, bhi, focused ? kOutlineFocus : kOutline, 6.0f, 0, 1.0f);
+        const ImU32 arrow = focused ? kInk : kMuted;
+        Text(dl, font, 17.0f, ImVec2(blo.x + 12.0f, blo.y + (box_h - 17.0f) * 0.5f), arrow, "<");
+        Text(dl, font, 17.0f, ImVec2(bhi.x - 12.0f - Width(font, 17.0f, ">"), blo.y + (box_h - 17.0f) * 0.5f),
+             arrow, ">");
+        const float tw = Width(font, 17.0f, value.c_str());
+        Text(dl, font, 17.0f, ImVec2(mid.x - tw * 0.5f, blo.y + (box_h - 17.0f) * 0.5f), focused ? kInk : kSoft,
+             value.c_str());
+        continue;
+      }
+      // Every choice as a segment, right-aligned; the current one filled.
       // Wide enough for the longest choice ("3840 x 2160").
       float seg_w = n >= 4 ? 72.0f : 86.0f;
       for (const char* choice : choices) seg_w = std::max(seg_w, Width(font, 17.0f, choice) + 22.0f);

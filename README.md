@@ -4,8 +4,8 @@ A native Windows PC port of **Hexic HD**, the Xbox 360 launch puzzle game by Car
 Games, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation.
 
 Play at **up to 4K and a steady 60 FPS**, with full mouse, keyboard and controller support
-that switches on the fly, offline High Scores and a native PC settings menu. No emulator
-required.
+that switches on the fly, offline High Scores, nine languages and a native PC settings menu. No
+emulator required.
 
 **Free and open-source.**
 
@@ -73,6 +73,9 @@ the game folder.
 - **Hot-swapping:** button prompts switch between keycaps and controller buttons as soon as
   you change device
 - Native PC **Settings** menu in place of the Xbox-only Achievements viewer
+- **Nine languages:** English, German, Spanish, French, Italian, Portuguese, Japanese,
+  Korean and Traditional Chinese, from the game's own translations (Auto follows your
+  Windows language)
 - Player name of your choice, shown on High Scores
 - Built-in update checker
 - Portable installation with local saves and settings, or a saves folder of your choice

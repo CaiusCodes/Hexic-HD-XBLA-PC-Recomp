@@ -82,14 +82,19 @@ Player
   Player name          Shown on High Scores and the new-high-score screen
                        (up to 15 characters). The game picks a fun name for
                        you the first time; leave it empty to get another
+  Language             The game's text: Auto (your Windows language, the
+                       default), English, Deutsch, Espanol, Francais,
+                       Italiano, Portugues, Japanese, Korean or Chinese
+                       (Traditional). Applies the next time you start the
+                       game. The PC screens (Settings, setup) stay in English
 Controls
   (the key list)       Change the keys (see CONTROLS)
 Updates
   Check for Updates    Shows your version. Press it to ask GitHub whether a
                        newer release of this port exists (see UPDATES)
 
-Changes apply immediately, except Renderer, and VSync when the renderer is
-Vulkan (both apply after a restart). Xbox Dashboard is now Quit Hexic, and
+Changes apply immediately, except Renderer, Language, and VSync when the
+renderer is Vulkan (these apply after a restart). Xbox Dashboard is now Quit Hexic, and
 the game's own Options screen (sound, piece pattern, credits) is now Game
 Options.
 

@@ -3947,10 +3947,10 @@ index 9dcab94..e8c2877 100644
  
    auto run = [e, buffer_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
 diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
-index 1fda053..58b7787 100644
+index 1fda053..2173019 100644
 --- a/src/kernel/xam/xam_info.cpp
 +++ b/src/kernel/xam/xam_info.cpp
-@@ -25,6 +25,8 @@
+@@ -25,9 +25,15 @@
  #include <windows.h>
  #endif
  
@@ -3959,7 +3959,41 @@ index 1fda053..58b7787 100644
  #include <fmt/format.h>
  #include <fmt/xchar.h>
  
-@@ -289,8 +291,11 @@ void XamLoaderLaunchTitle_entry(mapped_string raw_name_ptr, u32 flags) {
++#include <rex/cvar.h>
++
++REXCVAR_DECLARE(uint32_t, user_language);
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -183,19 +189,13 @@ u32 XGetGameRegion_entry() {
+ }
+ 
+ u32 XGetLanguage_entry() {
+-  auto desired_language = XLanguage::kEnglish;
+-
+-  // Switch the language based on game region.
+-  // TODO(benvanik): pull from xex header.
+-  uint32_t game_region = XEX_REGION_NTSCU;
+-  if (game_region & XEX_REGION_NTSCU) {
+-    desired_language = XLanguage::kEnglish;
+-  } else if (game_region & XEX_REGION_NTSCJ) {
+-    desired_language = XLanguage::kJapanese;
+-  }
+-  // Add more overrides?
+-
+-  return uint32_t(desired_language);
++  // The console's language setting is the user_language cvar (xam_user.cpp):
++  // 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean,
++  // 8 Traditional Chinese, 9 Portuguese, 10 Polish, 11 Russian. Titles pick their
++  // text by it (Hexic HD loads ja_g.xml and so on). Anything out of range is English.
++  const uint32_t language = REXCVAR_GET(user_language);
++  if (language >= 1 && language <= 11) return language;
++  return uint32_t(XLanguage::kEnglish);
+ }
+ 
+ u32 XamGetCurrentTitleId_entry() {
+@@ -289,8 +289,11 @@ void XamLoaderLaunchTitle_entry(mapped_string raw_name_ptr, u32 flags) {
  }
  
  void XamLoaderTerminateTitle_entry() {

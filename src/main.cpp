@@ -15,6 +15,11 @@ REXCVAR_DEFINE_INT32(hexic_controls_version, 0, "Hexic",
 // highlight is gotoAndStop("over").
 REXCVAR_DEFINE_BOOL(hexic_menu_trace, false, "Hexic", "Test-only: log menu frame-label jumps");
 
+// Settings > Language (hexic_language.h): the game's text language, read as it
+// starts. auto follows the Windows display language.
+REXCVAR_DEFINE_STRING(hexic_language, "auto", "Hexic",
+                      "Game text language: auto, en, de, es, fr, it, pt, ja, ko, zh (applies at the next start)");
+
 namespace {
 uint32_t GuestU32(const uint8_t* base, uint32_t address) {
   const uint8_t* p = base + address;
