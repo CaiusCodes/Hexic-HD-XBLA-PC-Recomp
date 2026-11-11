@@ -123,6 +123,17 @@ bool WriteConfig(const Paths& p, const std::string& key, const std::string& valu
 // Writes the default hexic_hd.toml when there is none.
 void EnsureSettings(const Paths& p);
 
+// The game's text language: hexic_language in hexic_hd.toml, the same list as
+// the game's Settings > Language (src/hexic_language.h). Index 0 is Auto (the
+// Windows display language); a missing or unknown value reads as Auto.
+int LanguageCount();
+const char* LanguageCode(int index);
+const wchar_t* LanguageName(int index);
+int LanguageIndex(const std::string& code);  // -1 if unknown
+int AutoLanguageIndex();                     // what Auto picks on this PC
+int CurrentLanguage(const Paths& p);
+bool SetLanguage(const Paths& p, int index);
+
 // --------------------------------------------------------------- extras --
 struct Extras {
   bool fullscreen = false;

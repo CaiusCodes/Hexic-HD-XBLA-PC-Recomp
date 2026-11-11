@@ -30,8 +30,8 @@ Like the recomp and want to support future projects? You can tip me on
 3. Select your Hexic HD XBLA package using **Browse package**, drag it onto the window, or
    place it alongside the executable (or in a `Game Package` folder) for automatic
    detection.
-4. Choose your options: fullscreen, desktop shortcut, and an optional folder of your own
-   for saves and settings.
+4. Choose your options: fullscreen, desktop shortcut, an optional folder of your own for
+   saves and settings, and the language.
 5. Click **Play**.
 
 ![Setup window](docs/screenshots/02-setup-ready.png)

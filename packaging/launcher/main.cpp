@@ -12,8 +12,9 @@
 //
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut]
-//           [--shortcut-folder <dir>] [--saves-folder <dir>]
-//   (--saves-folder: saves and settings in that folder instead of resources\userdata)
+//           [--shortcut-folder <dir>] [--saves-folder <dir>] [--language <code>]
+//   (--saves-folder: saves and settings in that folder instead of resources\userdata;
+//    --language: auto, en, de, es, fr, it, pt, ja, ko or zh, the game's text)
 //   Exit code 0 imported, 1 failed, 2 several packages found (pass --package), 3 none found.
 //
 // Any other arguments are passed on to the game.
@@ -37,7 +38,8 @@ namespace {
 
 using namespace hexic;
 
-int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& extras, const fs::path& saves_folder) {
+int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& extras, const fs::path& saves_folder,
+                  const std::string& language) {
   Log(L"Unattended setup");
   std::vector<Source> found;
   std::wstring why;
@@ -67,6 +69,13 @@ int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& ext
     Log(L"Unattended: " + message);
     if (!ok) return 1;
   }
+  if (!language.empty()) {
+    const int index = LanguageIndex(language);
+    if (index < 0 || !SetLanguage(p, index)) {
+      Log(L"Unattended: unknown language " + Widen(language));
+      return 1;
+    }
+  }
   return 0;
 }
 
@@ -78,6 +87,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   bool setup = false, unattended = false, update = false;
   std::wstring extras;
   fs::path saves_folder;
+  std::string language;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
@@ -93,6 +103,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       extras = argv[++i];
     } else if (arg == L"--saves-folder" && i + 1 < argc) {
       saves_folder = argv[++i];
+    } else if (arg == L"--language" && i + 1 < argc) {
+      for (const wchar_t ch : std::wstring(argv[++i])) language += static_cast<char>(ch < 128 ? ch : '?');
     } else if (arg == L"--shortcut-folder" && i + 1 < argc) {
       options.shortcut_folder = argv[++i];
     } else {
@@ -168,7 +180,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   options.forced = installed;
   options.update = update && installed;  // an incomplete install needs setup first
   options.reason = options.update ? L"--update" : installed ? L"--setup" : L"missing " + missing;
-  const int code = unattended ? RunUnattended(p, options, extras, saves_folder) : RunSetupWindow(instance, p, options);
+  const int code = unattended ? RunUnattended(p, options, extras, saves_folder, language) : RunSetupWindow(instance, p, options);
   if (mutex) {
     ReleaseMutex(mutex);
     CloseHandle(mutex);

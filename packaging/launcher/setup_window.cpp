@@ -36,24 +36,25 @@ namespace {
 using namespace Gdiplus;
 
 // ------------------------------------------------------------- layout --
-constexpr float kW = 720, kH = 646;
+constexpr float kW = 720, kH = 688;
 constexpr float kUiScale = 1.0f;
 
 struct Box {
   float x, y, w, h, r;
 };
-constexpr Box kBezel = {44, 12, 632, 622, 34};
-constexpr Box kCard = {62, 92, 596, 526, 28};
+constexpr Box kBezel = {44, 12, 632, 664, 34};
+constexpr Box kCard = {62, 92, 596, 568, 28};
 constexpr Box kPill = {90, 109, 540, 28, 14};
-constexpr Box kPanel = {74, 152, 572, 454, 20};
+constexpr Box kPanel = {74, 152, 572, 496, 20};
 constexpr Box kField = {98, 252, 380, 34, 7};
 constexpr Box kBar = {98, 356, 524, 12, 6};
 constexpr float kRowsY = 250, kRowPitch = 30;  // candidate rows when several packages are found
 constexpr int kMaxRows = 4;
 constexpr float kExtrasY = 402, kExtraFirst = 426, kExtraPitch = 42;
 constexpr float kSavesY = kExtraFirst + 2 * kExtraPitch;  // the saves-folder row, after the two extras
+constexpr float kLanguageY = kSavesY + kExtraPitch;      // the game's text language, last
 
-enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSaves, kSavesBrowse, kRow0 };
+enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSaves, kSavesBrowse, kLanguagePrev, kLanguageNext, kRow0 };
 
 enum class Mode { Idle, Choosing, Importing, Ready };
 
@@ -232,6 +233,8 @@ class SetupWindow {
   Extras want_, was_;
   // The saves folder (empty: resources\userdata), applied on Play like the extras.
   fs::path want_saves_, was_saves_;
+  // The game's text language (LanguageName() indices, 0 Auto), applied on Play.
+  int want_language_ = 0, was_language_ = 0;
   Control hover_ = kNone, pressed_ = kNone;
   bool tracking_ = false;
   std::atomic<bool> cancel_{false};
@@ -438,10 +441,12 @@ void SetupWindow::BuildBackdrop() {
 RectL SetupWindow::ControlRect(Control id) const {
   switch (id) {
     case kBrowse: return {490, 252, 132, 34};
-    case kLeft: return {352, 556, 112, 40};
-    case kPlay: return {476, 552, 146, 46};
+    case kLeft: return {352, 598, 112, 40};
+    case kPlay: return {476, 594, 146, 46};
     case kSaves: return {98, kSavesY - 6, 524, kExtraPitch - 2};
     case kSavesBrowse: return {500, kSavesY - 1, 122, 30};
+    case kLanguagePrev: return {448, kLanguageY - 1, 30, 30};
+    case kLanguageNext: return {592, kLanguageY - 1, 30, 30};
     case kExtra0:
     case kExtra1: return {98, kExtraFirst + (id - kExtra0) * kExtraPitch - 6, 524, kExtraPitch - 2};
     default: {
@@ -459,7 +464,9 @@ bool SetupWindow::Enabled(Control id) const {
     case kLeft: return !(mode_ == Mode::Importing && cancel_.load());
     case kPlay: return mode_ == Mode::Ready && installed_;
     case kSaves:
-    case kSavesBrowse: return mode_ != Mode::Importing;
+    case kSavesBrowse:
+    case kLanguagePrev:
+    case kLanguageNext: return mode_ != Mode::Importing;
     case kExtra0:
     case kExtra1: return true;
     default: return mode_ == Mode::Choosing && id - kRow0 < static_cast<int>(candidates_.size());
@@ -467,7 +474,7 @@ bool SetupWindow::Enabled(Control id) const {
 }
 
 Control SetupWindow::HitTest(float x, float y) const {
-  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSavesBrowse, kSaves};
+  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kSavesBrowse, kSaves, kLanguagePrev, kLanguageNext};
   if (mode_ == Mode::Choosing) {
     for (int i = 0; i < static_cast<int>(candidates_.size()) && i < kMaxRows; ++i)
       ids.push_back(static_cast<Control>(kRow0 + i));
@@ -757,6 +764,19 @@ void SetupWindow::Paint(HDC dc) {
                 false, custom);
       PaintButton(g, kSavesBrowse, L"Choose folder", Enabled(kSavesBrowse), false, pill_.get());
     }
+    // Language: the game's own translations; < and > step through them.
+    {
+      const float y = kLanguageY;
+      PaintText(g, L"Language", row_title_.get(), pal::Ink, RectF(132, y - 2, 310, 20));
+      const std::wstring detail = want_language_ == 0
+          ? std::wstring(L"The game's text. Auto follows Windows: ") + LanguageName(AutoLanguageIndex()) + L"."
+          : std::wstring(L"The game's text. Change it any time in Settings.");
+      PaintText(g, detail, row_detail_.get(), pal::Muted, RectF(132, y + 17, 310, 18));
+      PaintButton(g, kLanguagePrev, L"<", Enabled(kLanguagePrev), false, pill_.get());
+      PaintButton(g, kLanguageNext, L">", Enabled(kLanguageNext), false, pill_.get());
+      PaintText(g, LanguageName(want_language_), row_title_.get(), pal::Ink, RectF(480, y + 3, 110, 20),
+                StringAlignmentCenter);
+    }
     }  // extras
 
     // A cleared flower: six jewels around a silver centre, once it is ready.
@@ -771,7 +791,7 @@ void SetupWindow::Paint(HDC dc) {
 
     // Footer and the two buttons.
     PaintText(g, update_mode_ ? std::wstring(L"This copy v") + kVersion : std::wstring(L"Title ID 584107D1"), foot_.get(),
-              pal::Muted, RectF(98, 570, 220, 18));
+              pal::Muted, RectF(98, 612, 220, 18));
     const wchar_t* left = mode_ == Mode::Importing ? (cancel_.load() ? L"Cancelling" : L"Cancel") : L"Close";
     PaintButton(g, kLeft, left, Enabled(kLeft), false, button_.get());
     PaintButton(g, kPlay, L"PLAY", Enabled(kPlay), true, play_.get());
@@ -798,6 +818,8 @@ void SetupWindow::Start() {
   want_ = was_;
   was_saves_ = p_.custom_userdata ? p_.userdata : fs::path();
   want_saves_ = was_saves_;
+  was_language_ = CurrentLanguage(p_);
+  want_language_ = was_language_;
   if (!options_.package.empty()) {
     SelectPath(options_.package);
     return;
@@ -1119,6 +1141,7 @@ void SetupWindow::Play() {
     return MessageBoxW(hwnd_, text.c_str(), L"Hexic HD", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
   });
   was_ = want_;
+  if (want_language_ != was_language_ && SetLanguage(p_, want_language_)) was_language_ = want_language_;
   if (!note.empty()) MessageBoxW(hwnd_, note.c_str(), L"Hexic HD", MB_OK | MB_ICONINFORMATION);
   std::wstring error;
   if (!LaunchGame(p_, options_.game_args, &error)) {
@@ -1161,6 +1184,8 @@ void SetupWindow::Click(Control id) {
       else want_saves_.clear();
       break;
     case kSavesBrowse: ChooseSavesFolder(); break;
+    case kLanguagePrev: want_language_ = (want_language_ + LanguageCount() - 1) % LanguageCount(); break;
+    case kLanguageNext: want_language_ = (want_language_ + 1) % LanguageCount(); break;
     default:
       if (id >= kRow0 && id - kRow0 < static_cast<int>(candidates_.size())) StartImport(candidates_[id - kRow0]);
       break;

@@ -933,6 +933,58 @@ bool WriteConfig(const Paths& p, const std::string& key, const std::string& valu
   return WriteAll(p.config, out);
 }
 
+// ------------------------------------------------------------- language --
+namespace {
+struct LanguageDef {
+  const char* code;
+  const wchar_t* name;
+};
+// Same order and names as the game's (src/hexic_language.h).
+constexpr LanguageDef kLanguageDefs[] = {
+    {"auto", L"Auto"},        {"en", L"English"},          {"de", L"Deutsch"},  {"es", L"Español"},
+    {"fr", L"Français"}, {"it", L"Italiano"},         {"pt", L"Português"}, {"ja", L"Japanese"},
+    {"ko", L"Korean"},        {"zh", L"Chinese"},
+};
+}  // namespace
+
+int LanguageCount() { return static_cast<int>(sizeof(kLanguageDefs) / sizeof(kLanguageDefs[0])); }
+const char* LanguageCode(int index) { return kLanguageDefs[index].code; }
+const wchar_t* LanguageName(int index) { return kLanguageDefs[index].name; }
+
+int LanguageIndex(const std::string& code) {
+  for (int i = 0; i < LanguageCount(); ++i) {
+    if (_stricmp(code.c_str(), kLanguageDefs[i].code) == 0) return i;
+  }
+  return -1;
+}
+
+int AutoLanguageIndex() {
+  switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+    case LANG_GERMAN: return LanguageIndex("de");
+    case LANG_SPANISH: return LanguageIndex("es");
+    case LANG_FRENCH: return LanguageIndex("fr");
+    case LANG_ITALIAN: return LanguageIndex("it");
+    case LANG_PORTUGUESE: return LanguageIndex("pt");
+    case LANG_JAPANESE: return LanguageIndex("ja");
+    case LANG_KOREAN: return LanguageIndex("ko");
+    case LANG_CHINESE: return LanguageIndex("zh");
+    default: return LanguageIndex("en");
+  }
+}
+
+int CurrentLanguage(const Paths& p) {
+  std::string value;
+  if (!ReadConfig(p, "hexic_language", &value)) return 0;
+  const int index = LanguageIndex(value);
+  return index < 0 ? 0 : index;
+}
+
+bool SetLanguage(const Paths& p, int index) {
+  if (index < 0 || index >= LanguageCount()) return false;
+  Log(L"Language: " + Widen(LanguageCode(index)));
+  return WriteConfig(p, "hexic_language", std::string("\"") + LanguageCode(index) + "\"");
+}
+
 void EnsureSettings(const Paths& p) {
   std::error_code ec;
   fs::create_directories(p.userdata, ec);

@@ -42,6 +42,8 @@ FIRST-TIME SETUP
 4. Tick any extras you want (all optional, all off unless ticked):
      Start in fullscreen, Create desktop shortcut, and Keep saves and
      settings in another folder ("Choose folder" picks it; see PORTABLE DATA).
+   Language (< and >) picks the game's text; Auto follows Windows. It can be
+   changed later in Settings > Player.
 5. Click PLAY once it says HEXIC HD IS READY.
 
 From then on, opening "Hexic HD.exe" starts the game straight away. Setup
