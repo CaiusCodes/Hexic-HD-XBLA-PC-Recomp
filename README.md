@@ -72,6 +72,8 @@ the game folder.
 - **Xbox controller** support
 - **Hot-swapping:** button prompts switch between keycaps and controller buttons as soon as
   you change device
+- **Pauses by itself** when you switch to another window mid-game; **Alt+Enter** toggles
+  fullscreen
 - Native PC **Settings** menu in place of the Xbox-only Achievements viewer
 - **Nine languages:** English, German, Spanish, French, Italian, Portuguese, Japanese,
   Korean and Traditional Chinese, from the game's own translations (Auto follows your
@@ -99,6 +101,7 @@ Marathon, Timed and Survival scores on this PC.
 | Arrow Keys, W A S D | Move |
 | Backspace | Back |
 | Esc | Pause |
+| Alt+Enter | Fullscreen on / off |
 
 Keys can be customised under **Settings → Controls**.
 

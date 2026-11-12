@@ -139,6 +139,9 @@ in for a controller input. The defaults:
   Pause                       Esc (Start)
   Bumpers, Back button        1 / 3, Tab
   Right stick                 I J K L, stick clicks C / V
+  Fullscreen on / off         Alt+Enter
+
+Switching to another window during a game pauses it.
 
 To change them, open Settings > Controls. Every controller input is listed
 with its keys:
