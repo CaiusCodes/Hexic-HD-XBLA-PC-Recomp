@@ -76,7 +76,7 @@ the game folder.
 - **Nine languages:** English, German, Spanish, French, Italian, Portuguese, Japanese,
   Korean and Traditional Chinese, from the game's own translations (Auto follows your
   Windows language)
-- Player name of your choice, shown on High Scores
+- Player name of your choice, shown on High Scores, typed on the keyboard or with a controller on the on-screen keys
 - Built-in update checker
 - Portable installation with local saves and settings, or a saves folder of your choice
 
@@ -120,7 +120,6 @@ with it. Older installations using a separate Setup and `Game` folder can also b
 - Windows only.
 - Only the supported Hexic HD XBLA build (Title ID `584107D1`, version 2.0.1884.0) is
   accepted.
-- The player name can only be typed on a keyboard.
 - Windows SmartScreen may warn about the unsigned executable.
 
 ## Reporting Issues

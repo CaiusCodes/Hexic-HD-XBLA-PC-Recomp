@@ -83,7 +83,9 @@ Graphics
 Player
   Player name          Shown on High Scores and the new-high-score screen
                        (up to 15 characters). The game picks a fun name for
-                       you the first time; leave it empty to get another
+                       you the first time; leave it empty to get another.
+                       Type it, or use the on-screen keys: D-pad to move,
+                       A types, X deletes, Y capitals, START saves, B cancels
   Language             The game's text: Auto (your Windows language, the
                        default), English, Deutsch, Espanol, Francais,
                        Italiano, Portugues, Japanese, Korean or Chinese
@@ -213,7 +215,6 @@ KNOWN LIMITATIONS
 
 - Xbox LIVE features (online leaderboards, the achievements viewer) are not
   available; High Scores shows this PC's scores instead (see above).
-- The player name can only be typed on a keyboard.
 
 TROUBLESHOOTING
 ---------------

@@ -435,8 +435,13 @@ class HexicMenuInput {
   enum Action : int {
     kUp, kDown, kLeft, kRight, kConfirm, kBack, kAlt, kReset,
     kPrevPage, kNextPage,  // Q / E, Page Up / Page Down, LB / RB
+    kPadA, kStart,         // the pad's A alone (Enter is kConfirm too), Start
     kCount
   };
+
+  // Test only (SETTING=menu,<action>, hexic_input.h): actions pressed on the
+  // next poll of whichever dialog is open, as bits (1 << Action).
+  inline static std::atomic<uint32_t> g_test_actions{0};
 
   explicit HexicMenuInput(bool repeat_reset = false) : repeat_reset_(repeat_reset) {}
 
@@ -477,6 +482,8 @@ class HexicMenuInput {
         held[kReset] |= (b & XINPUT_GAMEPAD_X) != 0;
         held[kPrevPage] |= (b & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
         held[kNextPage] |= (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+        held[kPadA] = (b & XINPUT_GAMEPAD_A) != 0;
+        held[kStart] = (b & XINPUT_GAMEPAD_START) != 0;
       }
     }
     const auto now = std::chrono::steady_clock::now();
@@ -490,6 +497,10 @@ class HexicMenuInput {
         repeat_at_[i] = now + std::chrono::milliseconds(i == kReset ? 45 : 90);
       }
       was_held_[i] = held[i];
+    }
+    if (primed_) {
+      const uint32_t test = g_test_actions.exchange(0);
+      for (int i = 0; i < kCount; ++i) pressed_[i] = pressed_[i] || (test & (1u << i)) != 0;
     }
     primed_ = true;
   }
@@ -628,11 +639,27 @@ class HexicNameEntryDialog : public rex::ui::ImGuiDialog {
  private:
   static constexpr size_t kMaxName = 15;  // an Xbox gamertag
 
+  // The on-screen keyboard (for a controller; the mouse can click it too):
+  // four rows of ten characters, then Shift / Space / Delete / Done.
+  static constexpr int kKeyRows = 5, kKeyCols = 10;
+  struct SpecialKey {
+    const char* label;
+    int first_col, cols;
+  };
+  enum Special : int { kShiftKey, kSpaceKey, kDeleteKey, kDoneKey, kSpecialCount };
+  static int SpecialAt(int col);
+  // Types the key at (row, col); returns true for Done.
+  bool PressKey(int row, int col);
+  void Type(char c);
+
   HexicHdApp* app_;
   HexicMenuInput input_{true};
   std::string text_;
   bool has_opened_shown_ = false;
   std::chrono::steady_clock::time_point opened_at_{};
+  int row_ = 0, col_ = 0;  // the highlighted key
+  bool shift_ = true;      // capitals: for a first letter, and after a space
+  ImVec2 last_mouse_{-1.0f, -1.0f};
 };
 
 // What Check for Updates found (HexicHdApp::StartUpdateCheck). Outside the
@@ -1003,6 +1030,20 @@ class HexicHdApp : public rex::ReXApp {
     hexic_input::TestPresses::g_setting_hook = [this](std::string name, std::string value) {
       // The update box: SETTING=open_updates,1 opens it as Settings would;
       // SETTING=dialog,down|up|press|back drives it (its keys are real input).
+      // Any PC dialog: SETTING=menu,up|down|left|right|confirm|back|alt|reset|a|start
+      // presses that action once; SETTING=open_name,1 opens the player name box.
+      if (name == "menu") {
+        static const char* kNames[] = {"up", "down", "left", "right", "confirm", "back",
+                                       "alt", "reset", "prev", "next", "a", "start"};
+        for (int i = 0; i < HexicMenuInput::kCount; ++i) {
+          if (value == kNames[i]) HexicMenuInput::g_test_actions.fetch_or(1u << i);
+        }
+        return;
+      }
+      if (name == "open_name") {
+        OpenNameEntry();
+        return;
+      }
       if (name == "dialog") {
         if (value == "down") ++test_dialog_moves_;
         if (value == "up") --test_dialog_moves_;
@@ -1974,7 +2015,46 @@ inline HexicNameEntryDialog::HexicNameEntryDialog(rex::ui::ImGuiDrawer* imgui_dr
                                                   HexicHdApp* app)
     : rex::ui::ImGuiDialog(imgui_drawer), app_(app), text_(HexicHdApp::SavedPlayerName()) {
   if (text_.size() > kMaxName) text_.resize(kMaxName);
+  shift_ = text_.empty() || text_.back() == ' ';
   app_->BeginModal();
+}
+
+namespace hexic_name_keys {
+inline constexpr const char* kRows[4] = {"ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ-_.!", "1234567890"};
+}
+
+inline int HexicNameEntryDialog::SpecialAt(int col) {
+  // Shift: columns 0-1, Space: 2-5, Delete: 6-7, Done: 8-9.
+  return col < 2 ? kShiftKey : col < 6 ? kSpaceKey : col < 8 ? kDeleteKey : kDoneKey;
+}
+
+inline void HexicNameEntryDialog::Type(char c) {
+  if (text_.size() >= kMaxName) return;
+  if (c == ' ' && (text_.empty() || text_.back() == ' ')) return;  // no leading or double spaces
+  text_.push_back(c);
+}
+
+inline bool HexicNameEntryDialog::PressKey(int row, int col) {
+  if (row < 4) {
+    char c = hexic_name_keys::kRows[row][col];
+    const bool letter = c >= 'A' && c <= 'Z';
+    if (letter && !shift_) c = static_cast<char>(c - 'A' + 'a');
+    Type(c);
+    if (letter) shift_ = false;
+    return false;
+  }
+  switch (SpecialAt(col)) {
+    case kShiftKey: shift_ = !shift_; return false;
+    case kSpaceKey:
+      Type(' ');
+      shift_ = true;
+      return false;
+    case kDeleteKey:
+      if (!text_.empty()) text_.pop_back();
+      shift_ = text_.empty() || text_.back() == ' ';
+      return false;
+    default: return true;
+  }
 }
 
 inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
@@ -1998,7 +2078,26 @@ inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
       }
     }
   }
-  if (input_.Pressed(HexicMenuInput::kReset) && !text_.empty()) text_.pop_back();
+  // Backspace / X delete; Tab / Y switch capitals for the on-screen keys.
+  if (input_.Pressed(HexicMenuInput::kReset)) PressKey(4, 6);
+  if (input_.Pressed(HexicMenuInput::kAlt)) shift_ = !shift_;
+  // Arrows / D-pad / stick move over the on-screen keys (wrapping round).
+  if (input_.Pressed(HexicMenuInput::kUp)) row_ = (row_ + kKeyRows - 1) % kKeyRows;
+  if (input_.Pressed(HexicMenuInput::kDown)) row_ = (row_ + 1) % kKeyRows;
+  if (input_.Pressed(HexicMenuInput::kLeft) || input_.Pressed(HexicMenuInput::kRight)) {
+    const int step = input_.Pressed(HexicMenuInput::kLeft) ? -1 : 1;
+    if (row_ < 4) {
+      col_ = (col_ + step + kKeyCols) % kKeyCols;
+    } else {
+      static const int kFirst[kSpecialCount] = {0, 2, 6, 8};
+      col_ = kFirst[(SpecialAt(col_) + step + kSpecialCount) % kSpecialCount];
+    }
+  }
+  // (On the bottom row col_ keeps its column, so going up and down through it
+  // comes back to the same letter; the key lit there is the one over col_.)
+  // A types the highlighted key; Enter (keyboard), Start or the Done key save.
+  const bool pad_a = input_.Pressed(HexicMenuInput::kPadA);
+  bool done = pad_a && PressKey(row_, col_);
 
   constexpr float kWindowWidth = 500.0f;
   PushDialogStyle(io, kWindowWidth);
@@ -2006,13 +2105,13 @@ inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
       ImGui::BeginPopupModal("##HexicPlayerName", nullptr,
                              ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
   if (still_open) {
-    const bool save = input_.Pressed(HexicMenuInput::kConfirm);
     const bool cancel = input_.Pressed(HexicMenuInput::kBack);
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     const ImVec2 window_pos = ImGui::GetWindowPos();
     constexpr float kSideMargin = 26.0f;
-    const ImVec2 window_size(kWindowWidth, 236.0f);
+    constexpr float kKeyH = 36.0f, kKeyGap = 6.0f;
+    const ImVec2 window_size(kWindowWidth, 236.0f + kKeyRows * (kKeyH + kKeyGap) + 8.0f);
     const ImVec2 window_end(window_pos.x + window_size.x, window_pos.y + window_size.y);
     ImGui::Dummy(window_size);
 
@@ -2039,11 +2138,55 @@ inline void HexicNameEntryDialog::OnDraw(ImGuiIO& io) {
                          kAccentCyan, 2.0f);
     }
 
-    DrawHint(draw_list, window_pos.x, window_end.x, box_max.y + 16.0f,
-             "Shown on High Scores. Up to 15 characters.");
-    DrawHint(draw_list, window_pos.x, window_end.x, box_max.y + 42.0f,
-             "Enter  Save        Esc  Cancel        Backspace  Delete");
+    // The on-screen keys: the highlighted one green; the mouse highlights by
+    // hovering and types by clicking.
+    const ImVec2 mouse = io.MousePos;
+    const bool mouse_moved = mouse.x != last_mouse_.x || mouse.y != last_mouse_.y;
+    last_mouse_ = mouse;
+    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const float keys_x = box_min.x, keys_w = box_max.x - box_min.x;
+    const float key_w = (keys_w - (kKeyCols - 1) * kKeyGap) / kKeyCols;
+    const float keys_y = box_max.y + 18.0f;
+    static const char* kSpecialLabels[kSpecialCount] = {"Shift", "Space", "Delete", "Done"};
+    static const int kSpecialFirst[kSpecialCount] = {0, 2, 6, 8};
+    static const int kSpecialCols[kSpecialCount] = {2, 4, 2, 2};
+    for (int row = 0; row < kKeyRows; ++row) {
+      const int keys = row < 4 ? kKeyCols : kSpecialCount;
+      for (int i = 0; i < keys; ++i) {
+        const int col = row < 4 ? i : kSpecialFirst[i];
+        const int span = row < 4 ? 1 : kSpecialCols[i];
+        const ImVec2 lo(keys_x + col * (key_w + kKeyGap), keys_y + row * (kKeyH + kKeyGap));
+        const ImVec2 hi(lo.x + span * key_w + (span - 1) * kKeyGap, lo.y + kKeyH);
+        const bool hovered = mouse.x >= lo.x && mouse.x < hi.x && mouse.y >= lo.y && mouse.y < hi.y;
+        if (hovered && (mouse_moved || click)) {
+          row_ = row;
+          col_ = col;
+        }
+        if (hovered && click) done = PressKey(row, col) || done;
+        const bool lit = row == row_ && (row < 4 ? col == col_ : SpecialAt(col_) == i);
+        const bool shift_on = row == 4 && i == kShiftKey && shift_;
+        draw_list->AddRectFilled(lo, hi, lit ? IM_COL32(0x3E, 0xC6, 0x3A, 255) : IM_COL32(0x1C, 0x16, 0x38, 255), 7.0f);
+        draw_list->AddRect(lo, hi, lit ? IM_COL32(0xA8, 0xF0, 0x7A, 255)
+                                       : shift_on ? kAccentCyan : IM_COL32(0x5A, 0x50, 0x92, 200),
+                           7.0f, 0, shift_on ? 2.0f : 1.0f);
+        char letter[2] = {row < 4 ? hexic_name_keys::kRows[row][col] : '\0', '\0'};
+        if (row < 4 && !shift_ && letter[0] >= 'A' && letter[0] <= 'Z') letter[0] = static_cast<char>(letter[0] - 'A' + 'a');
+        const char* label = row < 4 ? letter : kSpecialLabels[i];
+        const float size = row < 4 ? BodySize() : BodySize() * 0.8f;
+        const ImVec2 ts = BodyFont()->CalcTextSizeA(size, FLT_MAX, 0, label);
+        draw_list->AddText(BodyFont(), size, ImVec2((lo.x + hi.x - ts.x) * 0.5f, (lo.y + hi.y - ts.y) * 0.5f),
+                           lit ? IM_COL32(0x0B, 0x20, 0x08, 255) : kTextSelected, label);
+      }
+    }
+    const float hints_y = keys_y + kKeyRows * (kKeyH + kKeyGap) + 6.0f;
+    DrawHint(draw_list, window_pos.x, window_end.x, hints_y, "Shown on High Scores. Up to 15 characters.");
+    DrawHint(draw_list, window_pos.x, window_end.x, hints_y + 26.0f,
+             hexic_input_mode::UsingController()
+                 ? "A  Type     X  Delete     Y  Shift     START  Save     B  Cancel"
+                 : "Type or click     Enter  Save     Esc  Cancel     Backspace  Delete");
 
+    const bool save = done || input_.Pressed(HexicMenuInput::kStart) ||
+                      (input_.Pressed(HexicMenuInput::kConfirm) && !pad_a);
     if (save || cancel) {
       if (save) {
         std::string name = text_;
