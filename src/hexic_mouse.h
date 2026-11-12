@@ -553,8 +553,13 @@ class MenuMouse {
       }
       if (learned) {
         lattice_known_ = true;
-        // Re-plan from scratch as a lattice move (keeping a pending click).
-        lattice_fresh_ = true;
+        // Re-plan from scratch as a lattice move, but only when the mouse was
+        // taking the cursor somewhere (or has a click pending). The move that
+        // taught the grid is usually the player's own, on a controller or the
+        // keys: on a new board, or after the cursor sat on a silver star (the
+        // middle of a hexagon, off the grid). Re-aiming at a pointer resting
+        // somewhere then dragged the cursor away from them (GitHub issue #1).
+        lattice_fresh_ = board_active_ || board_click_ != 0;
         board_active_ = false;
         blocked_valid_ = false;
         if (trace_) REXLOG_INFO("[mouse] board corners from ({:.1f},{:.1f})", lattice_x_, lattice_y_);
