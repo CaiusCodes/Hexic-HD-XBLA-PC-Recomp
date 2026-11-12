@@ -1040,6 +1040,10 @@ class HexicHdApp : public rex::ReXApp {
         }
         return;
       }
+      if (name == "focus_lost") {
+        OnWindowFocusChanged(false);
+        return;
+      }
       if (name == "open_name") {
         OpenNameEntry();
         return;
@@ -1070,6 +1074,16 @@ class HexicHdApp : public rex::ReXApp {
           ->SetPadFilterCallback([this](uint16_t& buttons, int16_t& lx, int16_t& ly) {
             const bool title = OnTitleScreen();
             buttons |= test_presses_.Poll() | any_key_starts_.Poll(title);
+            // The Enter of an Alt+Enter is not an A press (while it stays held).
+            if (GetTickCount64() - TitleInputListener::g_alt_enter_at.load(std::memory_order_relaxed) < 2000 &&
+                (GetAsyncKeyState(VK_RETURN) & 0x8000)) {
+              buttons &= ~uint16_t(0x1000);
+            }
+            // Paused for the player who switched to another window mid-game.
+            if (pause_polls_.load(std::memory_order_relaxed) > 0) {
+              pause_polls_.fetch_sub(1, std::memory_order_relaxed);
+              buttons |= 0x0010;  // Start
+            }
             if (!title) {
               menu_mouse_.Poll(runtime() ? runtime()->memory() : nullptr, buttons, lx, ly,
                                MouseBelongsToDialog());
@@ -1091,6 +1105,16 @@ class HexicHdApp : public rex::ReXApp {
     }
   }
 
+  // Switching to another window mid-game pauses it, as a console's Guide
+  // button would: Timed and Survival would otherwise run on unseen. Only while
+  // the board is in play (not on the pause screen, a menu or a level card);
+  // Start is held for two pad polls so the game sees one press.
+  void OnWindowFocusChanged(bool focused) override {
+    if (focused || hexic_mouse::g_screen.load(std::memory_order_relaxed) != hexic_mouse::kScreenActive) return;
+    pause_polls_.store(2, std::memory_order_relaxed);
+    REXLOG_INFO("[focus] window left mid-game: paused");
+  }
+
   // The game window's key and mouse input: on the title screen any key or
   // mouse button counts (hexic_title.h), and any of it (or a real mouse move)
   // switches the button prompts to the keyboard and mouse (hexic_input_mode.h).
@@ -1101,6 +1125,16 @@ class HexicHdApp : public rex::ReXApp {
     void OnKeyDown(rex::ui::KeyEvent& e) override {
       using rex::ui::VirtualKey;
       const VirtualKey key = e.virtual_key();
+      // Alt+Enter: fullscreen on / off (as Settings > Display mode). Enter is one
+      // of A's keys, so the pad filter keeps A off while this Enter is held.
+      if (key == VirtualKey::kReturn && e.is_alt_pressed()) {
+        if (e.repeat_count() == 0) {
+          HexicHdApp::SetPcFullscreen(!HexicHdApp::GetPcFullscreen());
+          g_alt_enter_at.store(GetTickCount64(), std::memory_order_relaxed);
+          REXLOG_INFO("[display] Alt+Enter: {}", HexicHdApp::GetPcFullscreen() ? "fullscreen" : "windowed");
+        }
+        return;
+      }
       if (key != VirtualKey::kMenu && key != VirtualKey::kLMenu && key != VirtualKey::kRMenu &&
           key != VirtualKey::kLWin && key != VirtualKey::kRWin && e.repeat_count() == 0) {
         target_->NotePress();
@@ -1113,6 +1147,9 @@ class HexicHdApp : public rex::ReXApp {
     }
     void OnMouseMove(rex::ui::MouseEvent& e) override { moves_.Note(e.x(), e.y()); }
     void OnMouseWheel(rex::ui::MouseEvent&) override { hexic_input_mode::NoteKeyboardMouse(); }
+
+    // When Alt+Enter last toggled fullscreen (GetTickCount64 ms).
+    inline static std::atomic<uint64_t> g_alt_enter_at{0};
 
    private:
     hexic_title::AnyKeyStarts* target_;
@@ -1576,6 +1613,7 @@ class HexicHdApp : public rex::ReXApp {
   hexic_input::TestPresses test_presses_;
   hexic_title::AnyKeyStarts any_key_starts_;
   TitleInputListener title_input_{&any_key_starts_};
+  std::atomic<int> pause_polls_{0};  // pad polls left holding Start (OnWindowFocusChanged)
   hexic_mouse::MenuMouse menu_mouse_;
   inline static HWND game_window_ = nullptr;  // found by ApplyWindowIcons
   rex::ui::ImGuiDrawer* imgui_drawer_ = nullptr;
